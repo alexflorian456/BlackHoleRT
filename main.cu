@@ -249,7 +249,7 @@ ray(Camera camera, unsigned char * skybox, unsigned char * pixels){
 
 void
 saveImage(std::string filename, const unsigned char * pixels, int width, int height) {
-    if (lodepng::encode(filename, pixels, width, height) != 0) {
+    if (0 != lodepng::encode(filename, pixels, width, height)) {
         std::cerr << "Error while saving PNG file: " << filename << std::endl;
     }
 }
