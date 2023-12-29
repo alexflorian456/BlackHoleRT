@@ -8,7 +8,7 @@
 #include "lodepng.h"
 
 #define WIDTH 800
-#define HEIGHT 450
+#define HEIGHT 600
 
 #define SKYBOX_WIDTH 2048
 #define SKYBOX_HEIGHT 1024
@@ -251,6 +251,7 @@ void
 saveImage(std::string filename, const unsigned char * pixels, int width, int height) {
     if (0 != lodepng::encode(filename, pixels, width, height)) {
         std::cerr << "Error while saving PNG file: " << filename << std::endl;
+        exit(1);
     }
 }
 
@@ -293,7 +294,7 @@ args:
     }
     if(0 != lodepng::decode(h_skybox_vector, unsigned_skybox_width, unsigned_skybox_height, skybox_filename)){
         std::cerr << "Error opening skybox file " << skybox_filename << std::endl;
-        return 1;
+        exit(1);
     };
     cudaMemcpy(d_skybox, h_skybox_vector.data(), SKYBOX_WIDTH * SKYBOX_HEIGHT * 4 * sizeof(unsigned char), cudaMemcpyHostToDevice);
     
@@ -304,6 +305,12 @@ args:
         double current_angle = angle_between_vectors(Vector::North(), camera.direction);
         ray<<<HEIGHT, WIDTH>>>(camera, d_skybox, d_pixels);
         cudaDeviceSynchronize();
+
+        cudaError_t cudaError = cudaGetLastError();
+        if (cudaError != cudaSuccess) {
+            std::cerr << "CUDA error: " << cudaGetErrorString(cudaError) << std::endl;
+            exit(1);
+        }
 
         char * output_path = (char *)malloc(25 * sizeof(char));
         sprintf(output_path, "output\\frame%03d.png", (int)angle);
