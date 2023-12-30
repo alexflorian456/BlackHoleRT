@@ -9,6 +9,16 @@
 
 #include "lodepng.h"
 
+__device__ __host__ double
+radians_to_degrees(double radians){
+    return radians * 180.0 / 3.1415;
+}
+
+__device__ __host__ double
+degrees_to_radians(double degrees){
+    return degrees * 3.1415 / 180.0;
+}
+
 class 
 Vector{
 
@@ -166,6 +176,19 @@ Camera{
             front_plane_distance(front_plane_distance), back_plane_distance(back_plane_distance)
         {}
 
+        Camera( int output_width, int output_height, int field_of_view,
+                Vector position, Vector direction, Vector up,
+                double front_plane_distance, double back_plane_distance):
+            
+            position(position), direction(direction), up(up),
+            front_plane_distance(front_plane_distance), back_plane_distance(back_plane_distance)
+        {
+            view_plane_distance = 1;
+            int theta = 90 - field_of_view / 2;
+            view_plane_width = 2 * view_plane_distance / std::tan(degrees_to_radians(theta));
+            double aspect_ratio = (double)output_width / (double)output_height;
+            view_plane_height = view_plane_width / aspect_ratio;
+        }
 };
 
 __device__ void
@@ -179,16 +202,6 @@ set_image_pixel(unsigned char * pixels, int i, int j, int output_width, Color co
 __device__ double
 image_to_view_plane(int n, int img_size, double view_plane_size){
     return - n * view_plane_size / img_size + view_plane_size / 2;
-}
-
-__device__ __host__ double
-radians_to_degrees(double radians){
-    return radians * 180.0 / 3.1415;
-}
-
-__device__ __host__ double
-degrees_to_radians(double degrees){
-    return degrees * 3.1415 / 180.0;
 }
 
 __device__ __host__ double
@@ -260,23 +273,22 @@ int
 main(int argc, char ** argv){
 /*
 args:
-1 - desired output width
-2 - desired output height
-3 - skybox filename, needs to be an equirectangular image (2:1 aspect ratio), optional, default: starmap_2020_2k_gal.png
+1 - output width
+2 - output height
+3 - field of view (degrees)
+4 - skybox filename, optional, needs to be an equirectangular image (2:1 aspect ratio), default: starmap_2020_2k_gal.png
 */
     int output_width    = atoi(argv[1]);
     int output_height   = atoi(argv[2]);
+    int field_of_view   = atoi(argv[3]);
 
     Vector camera_position  = Vector::Zero();
     Vector camera_direction = Vector::South();
     Vector camera_up        = Vector::Up();
-    const double view_plane_distance    = 20;
-    const double view_plane_width       = 160;
-    const double view_plane_height      = 90;
     const double front_plane_distance   = 0;
     const double back_plane_distance    = 1000;
-    Camera camera(  camera_position, camera_direction, camera_up,
-                    view_plane_distance, view_plane_width, view_plane_height,
+    Camera camera(  output_width, output_height, field_of_view,
+                    camera_position, camera_direction, camera_up,
                     front_plane_distance, back_plane_distance);
 
     unsigned char * d_pixels;
@@ -286,8 +298,8 @@ args:
     unsigned int skybox_width   = UINT32_MAX;
     unsigned int skybox_height  = UINT32_MAX;
     std::string skybox_filename;
-    if(argc > 3){
-        skybox_filename = argv[3];
+    if(argc > 4){
+        skybox_filename = argv[4];
     }
     else{
         skybox_filename = "starmap_2020_2k_gal.png";
