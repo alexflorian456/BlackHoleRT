@@ -264,7 +264,7 @@ ray(Camera camera,
 void
 saveImage(std::string filename, const unsigned char * pixels, int width, int height) {
     if (0 != lodepng::encode(filename, pixels, width, height)) {
-        std::cerr << "Error while saving PNG file: " << filename << std::endl;
+        fprintf(stderr, "Error when saving PNG file: %s\n", filename.c_str());
         exit(1);
     }
 }
@@ -276,12 +276,11 @@ args:
 1 - output width
 2 - output height
 3 - field of view (degrees)
-4 - skybox filename, optional, needs to be an equirectangular image (2:1 aspect ratio), default: starmap_2020_2k_gal.png
+4 - skybox filename, optional, must be an equirectangular image (2:1 aspect ratio), default: starmap_2020_2k_gal.png
 */
     int output_width    = atoi(argv[1]);
     int output_height   = atoi(argv[2]);
     int field_of_view   = atoi(argv[3]);
-
     Vector camera_position  = Vector::Zero();
     Vector camera_direction = Vector::South();
     Vector camera_up        = Vector::Up();
@@ -305,7 +304,7 @@ args:
         skybox_filename = "starmap_2020_2k_gal.png";
     }
     if(0 != lodepng::decode(h_skybox_vector, skybox_width, skybox_height, skybox_filename)){
-        std::cerr << "Error opening skybox file " << skybox_filename << std::endl;
+        fprintf(stderr, "Error opening skybox file %s\n", skybox_filename.c_str());
         exit(1);
     };
 
@@ -331,7 +330,7 @@ args:
                 ray<<<output_height, 1024>>>(camera, d_skybox, d_pixels, output_width, output_height, skybox_width, skybox_height, grid_index);
                 cudaError_t cudaError = cudaGetLastError();
                 if (cudaError != cudaSuccess) {
-                    std::cerr << "CUDA error: " << cudaGetErrorString(cudaError) << std::endl;
+                    fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(cudaError));
                     exit(1);
                 }
             }
@@ -339,7 +338,7 @@ args:
                 ray<<<output_height, remaining_width>>>(camera, d_skybox, d_pixels, output_width, output_height, skybox_width, skybox_height, grid_index);
                 cudaError_t cudaError = cudaGetLastError();
                 if (cudaError != cudaSuccess) {
-                    std::cerr << "CUDA error: " << cudaGetErrorString(cudaError) << std::endl;
+                    fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(cudaError));
                     exit(1);
                 }
             }
