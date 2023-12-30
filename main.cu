@@ -4,14 +4,10 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <cstdlib>
+#include <climits>
 
 #include "lodepng.h"
-
-#define WIDTH 800
-#define HEIGHT 600
-
-#define SKYBOX_WIDTH 2048
-#define SKYBOX_HEIGHT 1024
 
 class 
 Vector{
@@ -173,11 +169,11 @@ Camera{
 };
 
 __device__ void
-set_image_pixel(unsigned char * pixels, int i, int j, Color color){
-    pixels[i * WIDTH * 4 + j * 4 + 0] = color.red;
-    pixels[i * WIDTH * 4 + j * 4 + 1] = color.green;
-    pixels[i * WIDTH * 4 + j * 4 + 2] = color.blue;
-    pixels[i * WIDTH * 4 + j * 4 + 3] = color.alpha;
+set_image_pixel(unsigned char * pixels, int i, int j, int output_width, Color color){
+    pixels[i * output_width * 4 + j * 4 + 0] = color.red;
+    pixels[i * output_width * 4 + j * 4 + 1] = color.green;
+    pixels[i * output_width * 4 + j * 4 + 2] = color.blue;
+    pixels[i * output_width * 4 + j * 4 + 3] = color.alpha;
 }
 
 __device__ double
@@ -205,25 +201,30 @@ angle_between_vectors(Vector a, Vector b){ // result between 0 and 180
 }
 
 __device__ Color
-extract_skybox_color(unsigned char * pixels, int i, int j){
+extract_skybox_color(unsigned char * pixels, int i, int j, int skybox_width){
     return Color(
-        pixels[i * SKYBOX_WIDTH * 4 + j * 4 + 0],
-        pixels[i * SKYBOX_WIDTH * 4 + j * 4 + 1],
-        pixels[i * SKYBOX_WIDTH * 4 + j * 4 + 2],
-        pixels[i * SKYBOX_WIDTH * 4 + j * 4 + 3]
+        pixels[i * skybox_width * 4 + j * 4 + 0],
+        pixels[i * skybox_width * 4 + j * 4 + 1],
+        pixels[i * skybox_width * 4 + j * 4 + 2],
+        pixels[i * skybox_width * 4 + j * 4 + 3]
     );
 }
 
 __global__ void
-ray(Camera camera, unsigned char * skybox, unsigned char * pixels){
+ray(Camera camera,
+    unsigned char * skybox, unsigned char * pixels,
+    int output_width, int output_height,
+    int skybox_width, int skybox_height,
+    int grid_index){
+
     int i = blockIdx.x;
-    int j = threadIdx.x;
+    int j = threadIdx.x + grid_index * 1024;
 
     // initial ray direction
     Vector view_parallel = (camera.up ^ camera.direction).normalize();
     Vector camera_to_view_plane = camera.direction * camera.view_plane_distance;
-    double image_to_view_plane_width = image_to_view_plane(j, WIDTH, camera.view_plane_width);
-    double image_to_view_plane_height = image_to_view_plane(i, HEIGHT, camera.view_plane_height);
+    double image_to_view_plane_width    = image_to_view_plane(j, output_width , camera.view_plane_width);
+    double image_to_view_plane_height   = image_to_view_plane(i, output_height, camera.view_plane_height);
     Vector ray_direction = camera_to_view_plane + view_parallel * image_to_view_plane_width + camera.up * image_to_view_plane_height;
     
     // skybox rendering
@@ -233,18 +234,18 @@ ray(Camera camera, unsigned char * skybox, unsigned char * pixels){
     double projection_north_angle = angle_between_vectors(ray_direction_projection_on_xOz, Vector::North());
     double azimuth_angle = ray_direction_projection_on_xOz.z > 0 ?
                            projection_north_angle :
-                      (360-projection_north_angle); // if z component is negative => azimuth angle > 180 degrees
+                    (360 - projection_north_angle); // if z component is negative => azimuth angle > 180 degrees
 
     // TODO: why did i need printf("") before?
 
-    int skybox_height_coordinate = SKYBOX_HEIGHT * elevation_angle / 180;
-    int skybox_width_coordinate = SKYBOX_WIDTH * azimuth_angle / 360;
+    int skybox_height_coordinate    = skybox_height * elevation_angle / 180;
+    int skybox_width_coordinate     = skybox_width  * azimuth_angle   / 360;
 
     // printf("%d %d\n", skybox_height_coordinate, skybox_width_coordinate);
 
-    Color skybox_color = extract_skybox_color(skybox, skybox_height_coordinate, skybox_width_coordinate);
+    Color skybox_color = extract_skybox_color(skybox, skybox_height_coordinate, skybox_width_coordinate, skybox_width);
 
-    set_image_pixel(pixels, i, j, skybox_color);
+    set_image_pixel(pixels, i, j, output_width, skybox_color);
 }
 
 void
@@ -257,12 +258,15 @@ saveImage(std::string filename, const unsigned char * pixels, int width, int hei
 
 int
 main(int argc, char ** argv){
-
 /*
 args:
-1 - skybox filename, default: starmap_2020_2k_gal.png
+1 - desired output width
+2 - desired output height
+3 - skybox filename, needs to be an equirectangular image (2:1 aspect ratio), optional, default: starmap_2020_2k_gal.png
 */
-    
+    int output_width    = atoi(argv[1]);
+    int output_height   = atoi(argv[2]);
+
     Vector camera_position  = Vector::Zero();
     Vector camera_direction = Vector::South();
     Vector camera_up        = Vector::Up();
@@ -277,45 +281,65 @@ args:
 
     unsigned char * d_pixels;
     unsigned char * d_skybox;
-    unsigned char * h_pixels = new unsigned char[WIDTH * HEIGHT * 4];
+    unsigned char * h_pixels = (unsigned char *)malloc(output_width * output_height * 4 * sizeof(unsigned char));
     std::vector<unsigned char> h_skybox_vector;
-    
-    cudaMalloc((void **)&d_pixels, WIDTH * HEIGHT * 4 * sizeof(unsigned char));
-    cudaMalloc((void **)&d_skybox, SKYBOX_WIDTH * SKYBOX_HEIGHT * 4 * sizeof(unsigned char));
-
-    unsigned int unsigned_skybox_width = SKYBOX_WIDTH;
-    unsigned int unsigned_skybox_height = SKYBOX_HEIGHT;
+    unsigned int skybox_width   = UINT32_MAX;
+    unsigned int skybox_height  = UINT32_MAX;
     std::string skybox_filename;
-    if(argc > 1){
-        skybox_filename = argv[1];
+    if(argc > 3){
+        skybox_filename = argv[3];
     }
     else{
         skybox_filename = "starmap_2020_2k_gal.png";
     }
-    if(0 != lodepng::decode(h_skybox_vector, unsigned_skybox_width, unsigned_skybox_height, skybox_filename)){
+    if(0 != lodepng::decode(h_skybox_vector, skybox_width, skybox_height, skybox_filename)){
         std::cerr << "Error opening skybox file " << skybox_filename << std::endl;
         exit(1);
     };
-    cudaMemcpy(d_skybox, h_skybox_vector.data(), SKYBOX_WIDTH * SKYBOX_HEIGHT * 4 * sizeof(unsigned char), cudaMemcpyHostToDevice);
+
+    // assuming skybox image is equirectangular
+    int num_pixels  = h_skybox_vector.size() / 4;
+    skybox_height   = std::sqrt(num_pixels / 2);
+    skybox_width    = 2 * skybox_height;
+
+    cudaMalloc((void **)&d_pixels, output_width * output_height * 4 * sizeof(unsigned char));
+    cudaMalloc((void **)&d_skybox, skybox_width * skybox_height * 4 * sizeof(unsigned char));
+    cudaMemcpy(d_skybox, h_skybox_vector.data(), skybox_width * skybox_height * 4 * sizeof(unsigned char), cudaMemcpyHostToDevice);
     
     double angle = 0;
     double progress_percent = -1;
     while(angle < 360){
         camera.direction = Vector(std::cos(degrees_to_radians(angle)), 0, std::sin(degrees_to_radians(angle)));
         double current_angle = angle_between_vectors(Vector::North(), camera.direction);
-        ray<<<HEIGHT, WIDTH>>>(camera, d_skybox, d_pixels);
+
+        int remaining_width = output_width;
+        int grid_index = 0;
+        while(remaining_width > 0){
+            if(remaining_width >= 1024){
+                ray<<<output_height, 1024>>>(camera, d_skybox, d_pixels, output_width, output_height, skybox_width, skybox_height, grid_index);
+                cudaError_t cudaError = cudaGetLastError();
+                if (cudaError != cudaSuccess) {
+                    std::cerr << "CUDA error: " << cudaGetErrorString(cudaError) << std::endl;
+                    exit(1);
+                }
+            }
+            else{
+                ray<<<output_height, remaining_width>>>(camera, d_skybox, d_pixels, output_width, output_height, skybox_width, skybox_height, grid_index);
+                cudaError_t cudaError = cudaGetLastError();
+                if (cudaError != cudaSuccess) {
+                    std::cerr << "CUDA error: " << cudaGetErrorString(cudaError) << std::endl;
+                    exit(1);
+                }
+            }
+            remaining_width -= 1024;
+            grid_index++;
+        }
         cudaDeviceSynchronize();
 
-        cudaError_t cudaError = cudaGetLastError();
-        if (cudaError != cudaSuccess) {
-            std::cerr << "CUDA error: " << cudaGetErrorString(cudaError) << std::endl;
-            exit(1);
-        }
-
-        char * output_path = (char *)malloc(25 * sizeof(char));
+        char * output_path = (char*)malloc(25 * sizeof(char));
         sprintf(output_path, "output\\frame%03d.png", (int)angle);
-        cudaMemcpy(h_pixels, d_pixels, WIDTH * HEIGHT * 4 * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-        saveImage(output_path, h_pixels, WIDTH, HEIGHT);
+        cudaMemcpy(h_pixels, d_pixels, output_width * output_height * 4 * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+        saveImage(output_path, h_pixels, output_width, output_height);
 
         double current_progress_percent = angle / 360.0 * 100;
 
