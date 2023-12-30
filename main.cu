@@ -6,6 +6,8 @@
 #include <string>
 #include <cstdlib>
 #include <climits>
+#include <chrono>
+#include <ctime>
 
 #include "lodepng.h"
 
@@ -319,6 +321,7 @@ args:
     
     double angle = 0;
     double progress_percent = -1;
+    auto t_start = std::chrono::high_resolution_clock::now();
     while(angle < 360){
         camera.direction = Vector(std::cos(degrees_to_radians(angle)), 0, std::sin(degrees_to_radians(angle)));
         double current_angle = angle_between_vectors(Vector::North(), camera.direction);
@@ -350,17 +353,21 @@ args:
         char * output_path = (char*)malloc(25 * sizeof(char));
         sprintf(output_path, "output\\frame%03d.png", (int)angle);
         cudaMemcpy(h_pixels, d_pixels, output_width * output_height * 4 * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-        saveImage(output_path, h_pixels, output_width, output_height);
+        // saveImage(output_path, h_pixels, output_width, output_height);
 
         double current_progress_percent = angle / 360.0 * 100;
 
         if (current_progress_percent - progress_percent > 1) {
             progress_percent = current_progress_percent;
-            printf("%d%% Done\n", (int)progress_percent);
+            // printf("%d%% Done\n", (int)progress_percent);
         }
         
         angle++;
     }
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double duration = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    printf("Time: %f ms\n", duration);
+    printf("Estimated fps: %f\n", 360 / (duration / 1000));
 
     printf("Done\n");
     
