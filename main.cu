@@ -405,11 +405,15 @@ args:
     double progress_percent = -1;
     auto t_start = std::chrono::high_resolution_clock::now();
     while(angle < 360){ // TODO?: call multiple kernels from multiple threads
-        // ORIGINAL:
+        // SPIN IN THE CENTER:
         // camera.direction = Vector(std::cos(degrees_to_radians(angle)), 0, std::sin(degrees_to_radians(angle)));
+        // ORBIT AROUND CENTER:
         camera.position = Vector(std::cos(degrees_to_radians(angle)), 0, std::sin(degrees_to_radians(angle))) * camera_distance_from_center;
         camera.direction = (Vector::Zero() - camera.position).normalize();
-        
+        // MOVE INTO CENTER:
+        // TODO: issue noticed when camera is at "perfect" integer coordinates, got CUDA error: an illegal memory access was encountered
+        // camera.position = camera.position + camera.direction;
+
         int remaining_width = output_width;
         int grid_index = 0;
         int threads_per_block = 896; // TO STUDY: declared new variables in kernel, tried rendering 1080p
@@ -434,7 +438,7 @@ args:
         cudaDeviceSynchronize();
 
         char * output_path = (char*)malloc(25 * sizeof(char));
-        sprintf(output_path, "output\\frame%03d.png", (int)angle);
+        sprintf(output_path, "output\\frame%03d.png", (int)(angle*2.));
         cudaMemcpy(h_pixels, d_pixels, output_width * output_height * 4 * sizeof(unsigned char), cudaMemcpyDeviceToHost);
         saveImage(output_path, h_pixels, output_width, output_height);
 
@@ -445,7 +449,7 @@ args:
             printf("%d%% Done\n", (int)progress_percent);
         }
         
-        angle++;
+        angle += 0.5;
     }
     auto t_end = std::chrono::high_resolution_clock::now();
     double duration = std::chrono::duration<double, std::milli>(t_end - t_start).count();
