@@ -390,8 +390,8 @@ args:
     skybox_width    = 2 * skybox_height;
 
     // declaring black holes
-    h_black_holes.push_back(BlackHole(500, Vector(-20, 0, -20)));
-    h_black_holes.push_back(BlackHole(500, Vector( 20, 0,  20)));
+    h_black_holes.push_back(BlackHole(500, Vector(0, 0, 0)));
+    h_black_holes.push_back(BlackHole(500, Vector(0, 0, 40)));
     int num_black_holes = h_black_holes.size();
 
     // allocating device memory
@@ -404,15 +404,20 @@ args:
     double angle = 0;
     double progress_percent = -1;
     auto t_start = std::chrono::high_resolution_clock::now();
+    camera.position = Vector(60, 0, 0);
+
+    double black_hole_distance = 40;
+
     while(angle < 360){ // TODO?: call multiple kernels from multiple threads
         // SPIN IN THE CENTER:
         // camera.direction = Vector(std::cos(degrees_to_radians(angle)), 0, std::sin(degrees_to_radians(angle)));
         // ORBIT AROUND CENTER:
-        camera.position = Vector(std::cos(degrees_to_radians(angle)), 0, std::sin(degrees_to_radians(angle))) * camera_distance_from_center;
-        camera.direction = (Vector::Zero() - camera.position).normalize();
+        // camera.position = Vector(std::cos(degrees_to_radians(angle)), 0, std::sin(degrees_to_radians(angle))) * camera_distance_from_center;
+        // camera.direction = (Vector::Zero() - camera.position).normalize();
         // MOVE INTO CENTER:
         // TODO: issue noticed when camera is at "perfect" integer coordinates, got CUDA error: an illegal memory access was encountered
         // camera.position = camera.position + camera.direction;
+        
 
         int remaining_width = output_width;
         int grid_index = 0;
@@ -450,6 +455,17 @@ args:
         }
         
         angle += 0.5;
+
+        // collision
+        black_hole_distance-=0.25;
+        if(black_hole_distance < 0){
+            break;
+        }
+        h_black_holes.clear();
+        h_black_holes.push_back(BlackHole(500, Vector(0, 0, 0)));
+        h_black_holes.push_back(BlackHole(500, Vector(0, 0, black_hole_distance)));
+        
+        cudaMemcpy(d_black_holes, h_black_holes.data(), h_black_holes.size() * sizeof(BlackHole), cudaMemcpyHostToDevice);
     }
     auto t_end = std::chrono::high_resolution_clock::now();
     double duration = std::chrono::duration<double, std::milli>(t_end - t_start).count();
