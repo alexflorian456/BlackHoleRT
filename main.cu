@@ -1,5 +1,8 @@
 #include <cstdio>
+#include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#include <cuda_texture_types.h>
 #include <device_launch_parameters.h>
 #include <iostream>
 #include <vector>
@@ -8,21 +11,32 @@
 #include <climits>
 #include <chrono>
 #include <ctime>
+#include <numbers>
 
-#include "lodepng.h"
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/highgui.hpp>
 
+#define PI 3.14159265358979323846
 #define GRAVITATIONAL_CONSTANT 6.674e-3 // real gravitational constant is 6.674e-11
 #define RAY_TIME_RESOLUTION 1 // time between two ray positions when computing gravitational lensing
-#define RAY_MAX_ITERATIONS 300 // maximum amount of ray positions computed per pixel
+#define RAY_MAX_ITERATIONS 100 // maximum amount of ray positions computed per pixel
+
+void cudaHandleError(cudaError_t cudaResult){
+    if (cudaResult != cudaSuccess) {
+        fprintf(stderr, "CUDA handle error: %s: %s\n", cudaGetErrorName(cudaResult), cudaGetErrorString(cudaResult));
+        exit(1);
+    }
+}
 
 __device__ __host__ double
 radians_to_degrees(double radians){
-    return radians * 180.0 / 3.1415;
+    return radians * 180.0 / PI; // replace with pi constant
 }
 
 __device__ __host__ double
 degrees_to_radians(double degrees){
-    return degrees * 3.1415 / 180.0;
+    return degrees * PI / 180.0;
 }
 
 class 
@@ -223,10 +237,9 @@ BlackHole {
 
 __device__ void
 set_image_pixel(unsigned char * pixels, int i, int j, int output_width, Color color){
-    pixels[i * output_width * 4 + j * 4 + 0] = color.red;
-    pixels[i * output_width * 4 + j * 4 + 1] = color.green;
-    pixels[i * output_width * 4 + j * 4 + 2] = color.blue;
-    pixels[i * output_width * 4 + j * 4 + 3] = color.alpha;
+    pixels[i * output_width * 3 + j * 3 + 0] = color.red;
+    pixels[i * output_width * 3 + j * 3 + 1] = color.green;
+    pixels[i * output_width * 3 + j * 3 + 2] = color.blue;
 }
 
 __device__ double
@@ -246,22 +259,24 @@ angle_between_vectors(Vector a, Vector b){ // result between 0 and 180
 __device__ Color
 extract_skybox_color(unsigned char * pixels, int i, int j, int skybox_width){
     return Color(
-        pixels[i * skybox_width * 4 + j * 4 + 0],
-        pixels[i * skybox_width * 4 + j * 4 + 1],
-        pixels[i * skybox_width * 4 + j * 4 + 2],
-        pixels[i * skybox_width * 4 + j * 4 + 3]
+        pixels[i * skybox_width * 3 + j * 3 + 0],
+        pixels[i * skybox_width * 3 + j * 3 + 1],
+        pixels[i * skybox_width * 3 + j * 3 + 2],
+        0
     );
 }
 
-__global__ void
-ray(Camera camera,
-    unsigned char * skybox, unsigned char * pixels,
-    int output_width, int output_height,
-    int skybox_width, int skybox_height,
-    int grid_index, int block_size, // currently, even if ray is called as a "remainder" kernel with eg. <<<1920, 128>>>,
-                                    // block_size is still passed as the block size of a non-"remainder" kernel, eg. 896
-                                    // in order for the image coordinate arithmetic to be correct
-    BlackHole * black_holes, int num_black_holes){
+__global__ void // TODO: recycle variables, use scope operators to conserve register space
+ray(
+Camera camera,
+unsigned char * skybox, unsigned char * pixels,
+int output_width, int output_height,
+int skybox_width, int skybox_height,
+int grid_index, int block_size, // currently, even if ray is called as a "remainder" kernel with eg. <<<1920, 128>>>,
+                                // block_size is still passed as the block size of a "non-remainder" kernel, eg. 896
+                                // in order for the image coordinate arithmetic to be correct
+BlackHole * black_holes, int num_black_holes
+){
 
     int i = blockIdx.x;
     int j = threadIdx.x + grid_index * block_size;
@@ -281,7 +296,7 @@ ray(Camera camera,
     double gravitational_constant = GRAVITATIONAL_CONSTANT;
     double ray_time_resolution = RAY_TIME_RESOLUTION;
                                                 /* to paint a pixel black, the ray has to be stuck */
-    int escape_sphere_radius = 5;               /* in a sphere of radius = escape_radius           */
+    int escape_sphere_radius = 5;               /* in a sphere of radius = escape_sphere_radius    */
     Vector escape_sphere_center = old_position; /* centered in escape_sphere_center                */
     int escape_sphere_iterations = 10;          /* for escape_sphere_iterations iterations         */                                         
     for(int iter=0; iter<RAY_MAX_ITERATIONS; iter++){
@@ -318,7 +333,7 @@ ray(Camera camera,
     // skybox rendering
     double elevation_angle = angle_between_vectors(Vector::Up(), ray_direction); // 0 degrees <=> straight up, 180 degress <=> straight down
     // project ray_direction on xOz to calculate azimuth
-    Vector ray_direction_projection_on_xOz = Vector(ray_direction.x, 0, ray_direction.z);
+    Vector ray_direction_projection_on_xOz = Vector(ray_direction.x, 0, ray_direction.z); // TODO: reuse ray_direction, dont declare new var
     double projection_north_angle = angle_between_vectors(ray_direction_projection_on_xOz, Vector::North());
     double azimuth_angle = ray_direction_projection_on_xOz.z > 0 ?
                            projection_north_angle :
@@ -331,16 +346,16 @@ ray(Camera camera,
 
     Color skybox_color = extract_skybox_color(skybox, skybox_height_coordinate, skybox_width_coordinate, skybox_width);
 
-    set_image_pixel(pixels, i, j, output_width, skybox_color);
+    set_image_pixel(pixels, i, j, output_width, skybox_color); // shared mem
 }
 
-void
-saveImage(std::string filename, const unsigned char * pixels, int width, int height) {
-    if (0 != lodepng::encode(filename, pixels, width, height)) {
-        fprintf(stderr, "Error when saving PNG file: %s\n", filename.c_str());
-        exit(1);
-    }
-}
+// void
+// saveImage(std::string filename, const unsigned char * pixels, int width, int height) {
+//     if (0 != lodepng::encode(filename, pixels, width, height)) {
+//         fprintf(stderr, "Error when saving PNG file: %s\n", filename.c_str());
+//         exit(1);
+//     }
+// }
 
 int
 main(int argc, char ** argv){
@@ -370,24 +385,41 @@ args:
     std::vector<unsigned char> h_skybox;
     unsigned int skybox_width   = UINT32_MAX;
     unsigned int skybox_height  = UINT32_MAX;
-    std::string skybox_filename;
+    std::string skybox_filename = ".\\textures\\";
     BlackHole * d_black_holes;
     std::vector<BlackHole> h_black_holes;
     if(argc > 4){
-        skybox_filename = argv[4];
+        skybox_filename += argv[4];
     }
     else{
-        skybox_filename = "starmap_2020_2k_gal.png";
+        skybox_filename += "starmap_2020_2k_gal.png";
     }
-    if(0 != lodepng::decode(h_skybox, skybox_width, skybox_height, skybox_filename)){
+
+    // TODO: delete
+    // if(0 != lodepng::decode(h_skybox, skybox_width, skybox_height, skybox_filename)){
+    //     fprintf(stderr, "Error opening skybox file %s\n", skybox_filename.c_str());
+    //     exit(1);
+    // };
+
+    cv::Mat skybox_matrix = cv::imread(skybox_filename);
+    if(skybox_matrix.empty()){
         fprintf(stderr, "Error opening skybox file %s\n", skybox_filename.c_str());
         exit(1);
-    };
+    }
+    printf("Skybox matrix info:\n");
+    printf("datatype code: %d\n", skybox_matrix.type());
+    printf("Skybox width: %d\n", skybox_matrix.cols);
+    printf("Skybox height: %d\n", skybox_matrix.rows);
+    printf("Skybox channels: %d\n", skybox_matrix.channels());
 
+    // TODO: delete
     // assuming skybox image is equirectangular
-    int num_pixels  = h_skybox.size() / 4;
-    skybox_height   = std::sqrt(num_pixels / 2);
-    skybox_width    = 2 * skybox_height;
+    // int num_pixels  = h_skybox.size() / 4;
+    // skybox_height   = std::sqrt(num_pixels / 2);
+    // skybox_width    = 2 * skybox_height;
+
+    skybox_width = skybox_matrix.cols;
+    skybox_height = skybox_matrix.rows;
 
     // declaring black holes
     h_black_holes.push_back(BlackHole(500, Vector(0, 0, 0)));
@@ -395,12 +427,12 @@ args:
     int num_black_holes = h_black_holes.size();
 
     // allocating device memory
-    cudaMalloc((void **)&d_pixels, output_width * output_height * 4 * sizeof(unsigned char));
-    cudaMalloc((void **)&d_skybox, skybox_width * skybox_height * 4 * sizeof(unsigned char));
-    cudaMalloc((void **)&d_black_holes, num_black_holes * sizeof(BlackHole));
-    cudaMemcpy(d_skybox, h_skybox.data(), skybox_width * skybox_height * 4 * sizeof(unsigned char), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_black_holes, h_black_holes.data(), num_black_holes * sizeof(BlackHole), cudaMemcpyHostToDevice);
-    
+    cudaHandleError(cudaMalloc((void **)&d_pixels, output_width * output_height * 3 * sizeof(unsigned char)));
+    cudaHandleError(cudaMalloc((void **)&d_skybox, skybox_width * skybox_height * skybox_matrix.channels() * sizeof(unsigned char))); // TODO: texture2d
+    cudaHandleError(cudaMalloc((void **)&d_black_holes, num_black_holes * sizeof(BlackHole))); // TODO: 
+    cudaHandleError(cudaMemcpy(d_skybox, skybox_matrix.data, skybox_width * skybox_height * skybox_matrix.channels() * sizeof(unsigned char), cudaMemcpyHostToDevice));
+    cudaHandleError(cudaMemcpy(d_black_holes, h_black_holes.data(), num_black_holes * sizeof(BlackHole), cudaMemcpyHostToDevice));
+
     double angle = 0;
     double progress_percent = -1;
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -417,7 +449,6 @@ args:
         // MOVE INTO CENTER:
         // TODO: issue noticed when camera is at "perfect" integer coordinates, got CUDA error: an illegal memory access was encountered
         // camera.position = camera.position + camera.direction;
-        
 
         int remaining_width = output_width;
         int grid_index = 0;
@@ -434,18 +465,29 @@ args:
             }
             cudaError_t cudaError = cudaGetLastError();
             if (cudaError != cudaSuccess) {
-                fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(cudaError));
+                fprintf(stderr, "CUDA error line 468: %s: %s\n", cudaGetErrorName(cudaError), cudaGetErrorString(cudaError));
                 exit(1);
             }
             remaining_width -= threads_per_block;
             grid_index++;
         }
         cudaDeviceSynchronize();
+        cudaError_t cudaError = cudaGetLastError();
+        if (cudaError != cudaSuccess) {
+            fprintf(stderr, "CUDA error line 477: %s: %s\n", cudaGetErrorName(cudaError), cudaGetErrorString(cudaError));
+            exit(1);
+        }
 
-        char * output_path = (char*)malloc(25 * sizeof(char));
+        char * output_path = (char*)malloc(25 * sizeof(char)); //TODO: free
         sprintf(output_path, "output\\frame%03d.png", (int)(angle*2.));
-        cudaMemcpy(h_pixels, d_pixels, output_width * output_height * 4 * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-        saveImage(output_path, h_pixels, output_width, output_height);
+        cudaHandleError(cudaMemcpy(h_pixels, d_pixels, output_width * output_height * 3 * sizeof(unsigned char), cudaMemcpyDeviceToHost));
+        // TODO: delete
+        // saveImage(output_path, h_pixels, output_width, output_height);
+        bool imwrite_success = cv::imwrite(output_path, cv::Mat(cv::Size(output_width, output_height), CV_8UC3, h_pixels));
+        if(!imwrite_success){
+            fprintf(stderr, "Failed to imwrite output frame\n");
+            exit(1);
+        }
 
         double current_progress_percent = angle / 360.0 * 100;
 
@@ -465,7 +507,7 @@ args:
         h_black_holes.push_back(BlackHole(500, Vector(0, 0, 0)));
         h_black_holes.push_back(BlackHole(500, Vector(0, 0, black_hole_distance)));
         
-        cudaMemcpy(d_black_holes, h_black_holes.data(), h_black_holes.size() * sizeof(BlackHole), cudaMemcpyHostToDevice);
+        cudaHandleError(cudaMemcpy(d_black_holes, h_black_holes.data(), h_black_holes.size() * sizeof(BlackHole), cudaMemcpyHostToDevice));
     }
     auto t_end = std::chrono::high_resolution_clock::now();
     double duration = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -473,6 +515,8 @@ args:
     printf("Estimated fps: %f\n", 360 / (duration / 1000));
 
     printf("Done\n");
+
+    //TODO: free memory
     
     return 0;
 }
