@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "CUDA Launch",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\build\\Debug\\BlackHoleRT.exe",
+            "args": [
+                "1920",
+                "1080",
+                "110",
+                "starmap_2020_4k_gal_lightened.png"
+            ],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "build",
+            "console": "integratedTerminal"
+        }
+    ]
+}

@@ -11,7 +11,7 @@ set(CMAKE_CUDA_STANDARD 17)
 include(CTest)
 enable_testing()
 
-add_executable(${CMAKE_PROJECT_NAME} main.cu)
+add_executable(${CMAKE_PROJECT_NAME} src/main.cu)
 
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /NODEFAULTLIB:LIBCMT")
 
@@ -19,7 +19,7 @@ set_property(TARGET ${CMAKE_PROJECT_NAME} PROPERTY CUDA_ARCHITECTURES 86)
 set_target_properties( ${CMAKE_PROJECT_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_compile_options(${CMAKE_PROJECT_NAME}
     PRIVATE $<$<COMPILE_LANGUAGE:CXX>: >
-    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>: >
+    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>: -Xcudafe --diag_suppress=esa_on_defaulted_function_ignored --expt-relaxed-constexpr>
 )
 
 find_package(OpenCV REQUIRED)
