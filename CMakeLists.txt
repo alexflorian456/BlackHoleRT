@@ -19,12 +19,18 @@ set_property(TARGET ${CMAKE_PROJECT_NAME} PROPERTY CUDA_ARCHITECTURES 86)
 set_target_properties( ${CMAKE_PROJECT_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_compile_options(${CMAKE_PROJECT_NAME}
     PRIVATE $<$<COMPILE_LANGUAGE:CXX>: >
-    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>: -Xcudafe --diag_suppress=esa_on_defaulted_function_ignored --expt-relaxed-constexpr>
+    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>: --verbose -Xcudafe --diag_suppress=esa_on_defaulted_function_ignored --expt-relaxed-constexpr>
 )
 
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 target_link_libraries(${CMAKE_PROJECT_NAME} ${OpenCV_LIBS})
+
+set(glfw3_DIR "C:/Program Files (x86)/GLFW/lib/cmake/glfw3")
+set(glfw3_INC_DIR "C:/Program Files (x86)/GLFW/include")
+find_package(glfw3 3.4 REQUIRED)
+target_link_libraries(${CMAKE_PROJECT_NAME} glfw opengl32.lib)
+include_directories(${glfw3_INC_DIR})
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
