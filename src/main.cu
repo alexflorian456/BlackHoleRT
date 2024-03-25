@@ -3,7 +3,6 @@
 #include <vector>
 #include <string>
 #include <cstdlib>
-#include <climits>
 #include <chrono>
 #include <ctime>
 
@@ -23,6 +22,8 @@
 #define PI 3.14159265358979323846f
 #define GRAVITATIONAL_CONSTANT 6.674e-3f // real gravitational constant is 6.674e-11
 #define RAY_TIME_RESOLUTION 1 // time between two ray positions when computing gravitational lensing
+
+//TODO: change dynamically based on distance to closest BH
 #define RAY_MAX_ITERATIONS 100 // maximum amount of ray positions computed per pixel
 
 void cudaHandleError(cudaError_t cudaResult){
@@ -40,6 +41,11 @@ radians_to_degrees(float radians){
 __device__ __host__ float
 degrees_to_radians(float degrees){
     return degrees * PI / 180.0f;
+}
+
+__device__ __host__ float
+clip(float x, float a, float b){
+    return (x < a) ? a : ((x > b) ? b : x);
 }
 
 // Function to initialize OpenGL
@@ -87,6 +93,36 @@ Vector{ // TODO: change to float or half? - maybe template
             return Vector(x, y, z);
         }
 
+        //projection of vector b onto vector a
+        __device__ __host__ static Vector
+        projection(Vector a, Vector b){
+            return b * ((a * b) / b.length()); 
+        }
+
+        // Rodrigues' rotation formula
+        __device__ __host__ Vector
+        rotate(float angle, Vector axis){ // angle is in radians
+            return *this * std::cos(angle) + (axis ^ *this) * std::sin(angle) + axis * (axis * *this) * (1 - std::cos(angle));
+        }
+
+        __device__ __host__ float
+        angle(Vector b) const{ // result between 0 and 180
+            float dot_product = *this * b;
+            float length_a = this->length();
+            float length_b = b.length();
+
+            return radians_to_degrees(std::acos(dot_product / (length_a * length_b)));
+        }
+
+        __device__ __host__ float
+        azimuth_angle_on_xOz() const{ // TODO: low priority, implement azimuth for any plane
+            Vector projection_on_xOz = Vector(x, 0, z);
+            float projection_north_angle = projection_on_xOz.angle(Vector::North());
+            return projection_on_xOz.z > 0 ?
+                   projection_north_angle :
+            (360 - projection_north_angle);
+        }
+
         __device__ __host__ Vector
         operator+(const Vector& b) const{
             return Vector(x + b.x, y + b.y, z + b.z);
@@ -120,6 +156,12 @@ Vector{ // TODO: change to float or half? - maybe template
         __device__ __host__ Vector
         operator+=(const Vector& b){
             *this = *this + b;
+            return *this;
+        }
+
+        __device__ __host__ Vector
+        operator-=(const Vector& b){
+            *this = *this - b;
             return *this;
         }
 
@@ -212,20 +254,27 @@ Camera{
         float front_plane_distance;
         float back_plane_distance;
 
+        //TODO: init in constructor
+        float elevation_angle; // between 0 and 180; 0 <=> straight up, 180 <=> straight down
+        float azimuth_angle; // between 0 and 360
+
         Camera( Vector position, Vector direction, Vector up,
                 float view_plane_distance, float view_plane_width, float view_plane_height,
                 float front_plane_distance, float back_plane_distance):
 
-            position(position), direction(direction), up(up),
+            position(position), direction(direction.normalize()), up(up.normalize()),
             view_plane_distance(view_plane_distance), view_plane_width(view_plane_width), view_plane_height(view_plane_height),
             front_plane_distance(front_plane_distance), back_plane_distance(back_plane_distance)
-        {}
+        {
+            elevation_angle = Vector::Up().angle(direction);
+            azimuth_angle = direction.azimuth_angle_on_xOz();
+        }
 
         Camera( int output_width, int output_height, int field_of_view,
                 Vector position, Vector direction, Vector up,
                 float front_plane_distance, float back_plane_distance):
             
-            position(position), direction(direction), up(up),
+            position(position), direction(direction.normalize()), up(up.normalize()),
             front_plane_distance(front_plane_distance), back_plane_distance(back_plane_distance)
         {
             view_plane_distance = 1;
@@ -233,6 +282,27 @@ Camera{
             view_plane_width = 2.f * view_plane_distance / std::tan(degrees_to_radians(theta));
             float aspect_ratio = (float)output_width / (float)output_height;
             view_plane_height = view_plane_width / aspect_ratio;
+        }
+
+        void increment_azimuth(float value){
+            azimuth_angle += value;
+            azimuth_angle = (float)((int)azimuth_angle % 360);
+            float azimuth_angle_radians = degrees_to_radians(azimuth_angle);
+
+            direction = Vector(std::sinf(azimuth_angle_radians), direction.y, std::cosf(azimuth_angle_radians)).normalize();
+            up = (Vector::Up() - Vector::projection(Vector::Up(), direction)).normalize();
+        }
+
+        void increment_elevation(float value){ // FIXME
+            elevation_angle += value;
+            elevation_angle = clip(elevation_angle, 0, 180);
+            float elevation_angle_radians = degrees_to_radians(elevation_angle);
+            float cos_elevation_angle = std::cosf(elevation_angle_radians);
+            float cos_elevation_angle_2 = std::cosf(elevation_angle_radians) * std::cosf(elevation_angle_radians);
+            float c = direction.x * direction.x + direction.z * direction.z;
+
+            direction = Vector(direction.x, (1 + std::sqrtf(1 - 4 * c * cos_elevation_angle_2))/(2 * cos_elevation_angle), direction.z).normalize();
+            up = (Vector::Up() - Vector::projection(Vector::Up(), direction)).normalize();
         }
 };
 
@@ -261,21 +331,12 @@ image_to_view_plane(int n, int img_size, float view_plane_size){
     return - n * view_plane_size / img_size + view_plane_size / 2;
 }
 
-__device__ __host__ float
-angle_between_vectors(Vector a, Vector b){ // result between 0 and 180
-    float dot_product = a * b;
-    float length_a = a.length();
-    float length_b = b.length();
-
-    return radians_to_degrees(std::acos(dot_product / (length_a * length_b)));
-}
-
 __device__ Color
 extract_texture_color(cudaTextureObject_t texture_object, float i, float j, int skybox_width){
     return Color(
-        tex2D<float4>(texture_object, j, i).z,
+        tex2D<float4>(texture_object, j, i).x, // TODO: try with memcpy
         tex2D<float4>(texture_object, j, i).y,
-        tex2D<float4>(texture_object, j, i).x,
+        tex2D<float4>(texture_object, j, i).z,
         0
     );
 }
@@ -300,15 +361,15 @@ BlackHole * black_holes, int num_black_holes
     Vector camera_to_view_plane = camera.direction * camera.view_plane_distance;
     float image_to_view_plane_width    = image_to_view_plane(j, output_width , camera.view_plane_width);
     float image_to_view_plane_height   = image_to_view_plane(i, output_height, camera.view_plane_height);
-    Vector ray_direction = camera_to_view_plane + view_parallel * image_to_view_plane_width + camera.up * image_to_view_plane_height;
+    Vector ray_direction = camera_to_view_plane + view_parallel * image_to_view_plane_width - camera.up * image_to_view_plane_height;
 
     // gravitational lensing computation
     Vector old_position = camera.position;
-    Vector old_velocity = ray_direction; // TODO?: try normalize
+    Vector old_velocity = ray_direction.normalize(); // TODO?: try normalize
     Vector new_position = Vector::Zero();
     Vector new_velocity = Vector::Zero();
-    float gravitational_constant = GRAVITATIONAL_CONSTANT;
-    float ray_time_resolution = RAY_TIME_RESOLUTION;
+    constexpr float gravitational_constant = GRAVITATIONAL_CONSTANT;
+    constexpr float ray_time_resolution = RAY_TIME_RESOLUTION;
                                                 /* to paint a pixel black, the ray has to be stuck */
     int escape_sphere_radius = 5;               /* in a sphere of radius = escape_sphere_radius    */
     Vector escape_sphere_center = old_position; /* centered in escape_sphere_center                */
@@ -345,13 +406,8 @@ BlackHole * black_holes, int num_black_holes
     ray_direction = new_velocity;
     
     // skybox rendering
-    float elevation_angle = angle_between_vectors(Vector::Up(), ray_direction); // 0 degrees <=> straight up, 180 degress <=> straight down
-    // project ray_direction on xOz to calculate azimuth
-    Vector ray_direction_projection_on_xOz = Vector(ray_direction.x, 0, ray_direction.z); // TODO: reuse ray_direction, dont declare new var
-    float projection_north_angle = angle_between_vectors(ray_direction_projection_on_xOz, Vector::North());
-    float azimuth_angle = ray_direction_projection_on_xOz.z > 0 ?
-                           projection_north_angle :
-                    (360 - projection_north_angle); // if z component is negative => azimuth angle > 180 degrees
+    float elevation_angle = Vector::Up().angle(ray_direction); // 0 degrees <=> straight up, 180 degress <=> straight down
+    float azimuth_angle = ray_direction.azimuth_angle_on_xOz();
 
     // TO STUDY: why did i need printf("") before?
 
@@ -378,12 +434,14 @@ args:
     Vector camera_position  = Vector::Zero();
     Vector camera_direction = Vector::South();
     Vector camera_up        = Vector::Up();
-    const float front_plane_distance   = 0;
-    const float back_plane_distance    = 1000;
-    const float camera_distance_from_center = 60;
+    constexpr float front_plane_distance   = 0;
+    constexpr float back_plane_distance    = 1000;
+    constexpr float camera_distance_from_center = 60;
     Camera camera(  output_width, output_height, field_of_view,
                     camera_position, camera_direction, camera_up,
                     front_plane_distance, back_plane_distance);
+    constexpr float movement_speed = 0.1f;
+    constexpr float look_speed = 0.2f;    
 
     unsigned char * d_pixels;
     unsigned char * h_pixels = (unsigned char *)malloc(output_width * output_height * 3 * sizeof(unsigned char)); // TODO: check if 3 or 4
@@ -406,7 +464,7 @@ args:
         exit(1);
     }
     if(skybox_matrix.channels() == 3){
-        cv::cvtColor(skybox_matrix, skybox_matrix, cv::COLOR_BGR2BGRA);
+        cv::cvtColor(skybox_matrix, skybox_matrix, cv::COLOR_BGR2RGBA);
     }
     skybox_matrix.convertTo(skybox_matrix, CV_32FC4);
     printf("Skybox matrix info:\n");
@@ -453,25 +511,26 @@ args:
     cudaHandleError(cudaMemcpy(d_black_holes, h_black_holes.data(), num_black_holes * sizeof(BlackHole), cudaMemcpyHostToDevice));
 
     // initialize GLFW
-    GLFWwindow* window;
+    GLFWwindow* main_window;
 
     if(!glfwInit()){
         return -1;
     }
 
-    window = glfwCreateWindow(640, 480, "Hello World", NULL, NULL);
-    if(!window){
+    main_window = glfwCreateWindow(640, 480, "Hello World", NULL, NULL);
+    if(!main_window){
         glfwTerminate();
         return -1;
     }
 
-    glfwMakeContextCurrent(window);
+    glfwMakeContextCurrent(main_window);
+    glfwSetInputMode(main_window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
 
     initOpenGL(output_width, output_height);
 
-    GLuint textureID;
-    glGenTextures(1, &textureID);
-    glBindTexture(GL_TEXTURE_2D, textureID);
+    GLuint screen_texture_id;
+    glGenTextures(1, &screen_texture_id);
+    glBindTexture(GL_TEXTURE_2D, screen_texture_id);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, output_width, output_height, 0, GL_RGB, GL_UNSIGNED_BYTE, h_pixels);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -481,11 +540,24 @@ args:
     auto t_start = std::chrono::high_resolution_clock::now();
     camera.position = Vector(60, 0, 0);
 
-    float black_hole_distance = 40;
+    // float black_hole_distance = 40;
 
-    glfwSetWindowMonitor(window, glfwGetPrimaryMonitor(), 0, 0, 1920, 1080, GLFW_DONT_CARE);
+    // Get the primary monitor
+    GLFWmonitor* primaryMonitor = glfwGetPrimaryMonitor();
+    const GLFWvidmode* mode = glfwGetVideoMode(primaryMonitor);
+    glfwSetWindowMonitor(main_window, primaryMonitor, 0, 0, mode->width, mode->height, GLFW_DONT_CARE);
+    glfwSetCursorPos(main_window, mode->width/2, mode->height/2);
 
-    while(angle < 360 && !glfwWindowShouldClose(window)){ // TODO?: call multiple kernels from multiple threads
+    printf("Screen width: %d\n", mode->width);
+    printf("Screen height: %d\n", mode->height);
+    printf("Screen refresh rate: %d\n", mode->refreshRate);
+
+    int frames_processed = 0;
+    double mouse_x;
+    double mouse_y;
+    float delta_mouse_x;
+    float delta_mouse_y;
+    while(!glfwWindowShouldClose(main_window)){ // TODO?: call multiple kernels from multiple threads
         // SPIN IN THE CENTER:
         // camera.direction = Vector(std::cos(degrees_to_radians(angle)), 0, std::sin(degrees_to_radians(angle)));
         // ORBIT AROUND CENTER:
@@ -493,14 +565,15 @@ args:
         // camera.direction = (Vector::Zero() - camera.position).normalize();
         // MOVE INTO CENTER:
         // TODO: issue noticed when camera is at "perfect" integer coordinates, got CUDA error: an illegal memory access was encountered
-        camera.position = camera.position + camera.direction / 2;
+        // camera.position = camera.position + camera.direction / 2;
 
         int remaining_width = output_width;
         int grid_index = 0;
-        constexpr int threads_per_block = 896; // TO STUDY: declared new variables in kernel, tried rendering 1080p
+        constexpr int threads_per_block = 1024; // TO STUDY: declared new variables in kernel, tried rendering 1080p
                                      // with 1024 threads per block (what was by defualt) and got:
                                      // "CUDA error: too many resources requested for launch"
                                      // (works with 896 on my GPU, but might differ on others)
+                                     // SOLUTION: switching from double precision to single precision
 
         auto frame_start = std::chrono::high_resolution_clock::now();
         while(remaining_width > 0){
@@ -521,7 +594,8 @@ args:
         cudaDeviceSynchronize();
         auto frame_end = std::chrono::high_resolution_clock::now();
         float frame_duration = std::chrono::duration<float, std::milli>(frame_end - frame_start).count();
-        // printf("frame%03d time: %f\n", (int)(angle*2.), frame_duration);
+        printf("frame%03d time: %f; camera elevation angle: %f\n", (int)(angle*2.), frame_duration, camera.elevation_angle);
+
         auto other_start = std::chrono::high_resolution_clock::now();
         cudaError_t cudaError = cudaGetLastError();
         if (cudaError != cudaSuccess) {
@@ -531,7 +605,40 @@ args:
 
         cudaHandleError(cudaMemcpy(h_pixels, d_pixels, output_width * output_height * 3 * sizeof(unsigned char), cudaMemcpyDeviceToHost));
 
-        glBindTexture(GL_TEXTURE_2D, textureID);
+        // TODO: refactor to controls method
+        if (glfwGetKey(main_window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+            glfwSetWindowShouldClose(main_window, GLFW_TRUE);
+        }
+        if(glfwGetKey(main_window, GLFW_KEY_W) == GLFW_PRESS){
+            camera.position += camera.direction * movement_speed;
+        }
+        if(glfwGetKey(main_window, GLFW_KEY_S) == GLFW_PRESS){
+            camera.position -= camera.direction * movement_speed;
+        }
+        if(glfwGetKey(main_window, GLFW_KEY_A) == GLFW_PRESS){
+            camera.position += (camera.up ^ camera.direction) * movement_speed;
+        }
+        if(glfwGetKey(main_window, GLFW_KEY_D) == GLFW_PRESS){
+            camera.position -= (camera.up ^ camera.direction) * movement_speed;
+        }
+        if(glfwGetKey(main_window, GLFW_KEY_SPACE) == GLFW_PRESS){
+            camera.position += Vector::Up() * movement_speed;
+        }
+        if(glfwGetKey(main_window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS){
+            camera.position += Vector::Down() * movement_speed;
+        }
+        glfwGetCursorPos(main_window, &mouse_x, &mouse_y);
+        glfwSetCursorPos(main_window, mode->width/2, mode->height/2);
+        delta_mouse_x = (float)mouse_x - mode->width/2;
+        delta_mouse_y = (float)mouse_y - mode->height/2;
+        if(delta_mouse_x != 0){
+            camera.increment_azimuth(-look_speed * delta_mouse_x);
+        }
+        if(delta_mouse_y != 0){
+            camera.increment_elevation(look_speed * delta_mouse_y);
+        }
+
+        glBindTexture(GL_TEXTURE_2D, screen_texture_id);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, output_width, output_height, GL_RGB, GL_UNSIGNED_BYTE, h_pixels);
 
         glClear(GL_COLOR_BUFFER_BIT);
@@ -543,7 +650,7 @@ args:
         glTexCoord2f(0, 1); glVertex2f(0, (GLfloat)output_height);
         glEnd();
 
-        glfwSwapBuffers(window);
+        glfwSwapBuffers(main_window);
 
         glfwPollEvents();
 
@@ -565,24 +672,26 @@ args:
         
         angle += 0.5;
 
-        // collision
-        black_hole_distance-=0.25;
-        if(black_hole_distance < 0){
-            break;
-        }
+        // // collision
+        // black_hole_distance-=0.25;
+        // if(black_hole_distance < 0){
+        //     break;
+        // }
         h_black_holes.clear();
-        h_black_holes.push_back(BlackHole(500, Vector(0, 0, 0)));
+        h_black_holes.push_back(BlackHole(1000, Vector(0, 0, 0)));
         // h_black_holes.push_back(BlackHole(500, Vector(0, 0, black_hole_distance)));
         
         cudaHandleError(cudaMemcpy(d_black_holes, h_black_holes.data(), h_black_holes.size() * sizeof(BlackHole), cudaMemcpyHostToDevice));
         auto other_end = std::chrono::high_resolution_clock::now();
         float other_duration = std::chrono::duration<float, std::milli>(other_end - other_start).count();
-        printf("frame%03d other time: %f\n", (int)(angle*2.), other_duration);
+
+        frames_processed++;
+        // printf("frame%03d other time: %f\n", (int)(angle*2.), other_duration);
     }
     auto t_end = std::chrono::high_resolution_clock::now();
     float duration = std::chrono::duration<float, std::milli>(t_end - t_start).count();
     printf("Time: %f ms\n", duration);
-    printf("Estimated fps: %f\n", 160 / (duration / 1000));
+    printf("Estimated fps: %f\n", frames_processed / (duration / 1000));
 
     printf("Done\n");
 
