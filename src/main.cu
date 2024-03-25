@@ -101,8 +101,8 @@ Vector{ // TODO: change to float or half? - maybe template
 
         // Rodrigues' rotation formula
         __device__ __host__ Vector
-        rotate(float angle, Vector axis){ // angle is in radians
-            return *this * std::cos(angle) + (axis ^ *this) * std::sin(angle) + axis * (axis * *this) * (1 - std::cos(angle));
+        rotate(float angle, Vector axis) const{ // angle is in radians
+            return *this * std::cosf(angle) + (axis ^ *this) * std::sinf(angle) + axis * (axis * *this) * (1 - std::cosf(angle));
         }
 
         __device__ __host__ float
@@ -282,27 +282,24 @@ Camera{
             view_plane_width = 2.f * view_plane_distance / std::tan(degrees_to_radians(theta));
             float aspect_ratio = (float)output_width / (float)output_height;
             view_plane_height = view_plane_width / aspect_ratio;
+
+            elevation_angle = Vector::Up().angle(direction);
+            azimuth_angle = direction.azimuth_angle_on_xOz();
         }
 
-        void increment_azimuth(float value){
-            azimuth_angle += value;
+        void update_direction(float value_x, float value_y){
+            azimuth_angle += value_x;
             azimuth_angle = (float)((int)azimuth_angle % 360);
             float azimuth_angle_radians = degrees_to_radians(azimuth_angle);
 
-            direction = Vector(std::sinf(azimuth_angle_radians), direction.y, std::cosf(azimuth_angle_radians)).normalize();
-            up = (Vector::Up() - Vector::projection(Vector::Up(), direction)).normalize();
-        }
-
-        void increment_elevation(float value){ // FIXME
-            elevation_angle += value;
+            elevation_angle += value_y;
             elevation_angle = clip(elevation_angle, 0, 180);
-            float elevation_angle_radians = degrees_to_radians(elevation_angle);
-            float cos_elevation_angle = std::cosf(elevation_angle_radians);
-            float cos_elevation_angle_2 = std::cosf(elevation_angle_radians) * std::cosf(elevation_angle_radians);
-            float c = direction.x * direction.x + direction.z * direction.z;
+            
+            direction = Vector::Up().rotate(degrees_to_radians(elevation_angle), Vector::West()).normalize();
+            up = Vector::Up().rotate(degrees_to_radians(elevation_angle - 90.f), Vector::West()).normalize();
 
-            direction = Vector(direction.x, (1 + std::sqrtf(1 - 4 * c * cos_elevation_angle_2))/(2 * cos_elevation_angle), direction.z).normalize();
-            up = (Vector::Up() - Vector::projection(Vector::Up(), direction)).normalize();
+            direction = direction.rotate(degrees_to_radians(azimuth_angle), Vector::Up()).normalize();
+            up = up.rotate(degrees_to_radians(azimuth_angle), Vector::Up()).normalize();
         }
 };
 
@@ -436,11 +433,10 @@ args:
     Vector camera_up        = Vector::Up();
     constexpr float front_plane_distance   = 0;
     constexpr float back_plane_distance    = 1000;
-    constexpr float camera_distance_from_center = 60;
     Camera camera(  output_width, output_height, field_of_view,
                     camera_position, camera_direction, camera_up,
                     front_plane_distance, back_plane_distance);
-    constexpr float movement_speed = 0.1f;
+    constexpr float default_movement_speed = 0.2f;
     constexpr float look_speed = 0.2f;    
 
     unsigned char * d_pixels;
@@ -502,7 +498,7 @@ args:
 
     // declaring black holes
     h_black_holes.push_back(BlackHole(500, Vector(0, 0, 0)));
-    // h_black_holes.push_back(BlackHole(500, Vector(0, 0, 40)));
+    h_black_holes.push_back(BlackHole(500, Vector(0, 0, 40)));
     int num_black_holes = (int)h_black_holes.size();
 
     // allocating device memory
@@ -594,7 +590,7 @@ args:
         cudaDeviceSynchronize();
         auto frame_end = std::chrono::high_resolution_clock::now();
         float frame_duration = std::chrono::duration<float, std::milli>(frame_end - frame_start).count();
-        printf("frame%03d time: %f; camera elevation angle: %f\n", (int)(angle*2.), frame_duration, camera.elevation_angle);
+        printf("frame%03d time: %f\n", (int)(angle*2.), frame_duration);
 
         auto other_start = std::chrono::high_resolution_clock::now();
         cudaError_t cudaError = cudaGetLastError();
@@ -606,8 +602,12 @@ args:
         cudaHandleError(cudaMemcpy(h_pixels, d_pixels, output_width * output_height * 3 * sizeof(unsigned char), cudaMemcpyDeviceToHost));
 
         // TODO: refactor to controls method
+        float movement_speed = default_movement_speed;
         if (glfwGetKey(main_window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
             glfwSetWindowShouldClose(main_window, GLFW_TRUE);
+        }
+        if (glfwGetKey(main_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) {
+            movement_speed *= 2;
         }
         if(glfwGetKey(main_window, GLFW_KEY_W) == GLFW_PRESS){
             camera.position += camera.direction * movement_speed;
@@ -631,12 +631,12 @@ args:
         glfwSetCursorPos(main_window, mode->width/2, mode->height/2);
         delta_mouse_x = (float)mouse_x - mode->width/2;
         delta_mouse_y = (float)mouse_y - mode->height/2;
-        if(delta_mouse_x != 0){
-            camera.increment_azimuth(-look_speed * delta_mouse_x);
+        if(delta_mouse_x != 0 || delta_mouse_y != 0){
+            camera.update_direction(-look_speed * delta_mouse_x, look_speed * delta_mouse_y);
         }
-        if(delta_mouse_y != 0){
-            camera.increment_elevation(look_speed * delta_mouse_y);
-        }
+        // if(delta_mouse_x != 0){
+        //     camera.increment_azimuth(-look_speed * delta_mouse_x);
+        // }
 
         glBindTexture(GL_TEXTURE_2D, screen_texture_id);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, output_width, output_height, GL_RGB, GL_UNSIGNED_BYTE, h_pixels);
@@ -677,8 +677,8 @@ args:
         // if(black_hole_distance < 0){
         //     break;
         // }
-        h_black_holes.clear();
-        h_black_holes.push_back(BlackHole(1000, Vector(0, 0, 0)));
+        // h_black_holes.clear();
+        // h_black_holes.push_back(BlackHole(1000, Vector(0, 0, 0)));
         // h_black_holes.push_back(BlackHole(500, Vector(0, 0, black_hole_distance)));
         
         cudaHandleError(cudaMemcpy(d_black_holes, h_black_holes.data(), h_black_holes.size() * sizeof(BlackHole), cudaMemcpyHostToDevice));
