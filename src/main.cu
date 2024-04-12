@@ -22,11 +22,13 @@
 #define PI 3.14159265358979323846f
 #define GRAVITATIONAL_CONSTANT 6.674e-3f // real gravitational constant is 6.674e-11
 #define RAY_TIME_RESOLUTION 1 // time between two ray positions when computing gravitational lensing
+#define ESCAPE_SPHERE_ITERATIONS 10
+#define ESCAPE_SPHERE_RADIUS 5
 
 //TODO: change dynamically based on distance to closest BH
 #define RAY_MAX_ITERATIONS 100 // maximum amount of ray positions computed per pixel
 
-void cudaHandleError(cudaError_t cudaResult){
+void cudaHandleError(cudaError_t cudaResult){ // TODO?: convert to macro
     if (cudaResult != cudaSuccess) {
         fprintf(stderr, "CUDA handle error: %s: %s\n", cudaGetErrorName(cudaResult), cudaGetErrorString(cudaResult));
         exit(1);
@@ -48,8 +50,8 @@ clip(float x, float a, float b){
     return (x < a) ? a : ((x > b) ? b : x);
 }
 
-// Function to initialize OpenGL
-void initOpenGL(int width, int height) {
+void
+initOpenGL(int width, int height) {
     glViewport(0, 0, width, height);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
@@ -93,7 +95,7 @@ Vector{ // TODO: change to float or half? - maybe template
             return Vector(x, y, z);
         }
 
-        //projection of vector b onto vector a
+        // projection of vector b onto vector a
         __device__ __host__ static Vector
         projection(Vector a, Vector b){
             return b * ((a * b) / b.length()); 
@@ -105,8 +107,9 @@ Vector{ // TODO: change to float or half? - maybe template
             return *this * std::cosf(angle) + (axis ^ *this) * std::sinf(angle) + axis * (axis * *this) * (1 - std::cosf(angle));
         }
 
+        // angle between vectors in degrees - between 0 and 180
         __device__ __host__ float
-        angle(Vector b) const{ // result between 0 and 180
+        angle(Vector b) const{
             float dot_product = *this * b;
             float length_a = this->length();
             float length_b = b.length();
@@ -204,14 +207,14 @@ Vector{ // TODO: change to float or half? - maybe template
 class
 Color{ // TODO: change to float or half? - maybe template
     public:
-        unsigned char red;
-        unsigned char green;
-        unsigned char blue;
-        unsigned char alpha;
+        unsigned int red;
+        unsigned int green;
+        unsigned int blue;
+        unsigned int alpha;
 
         __device__
-        Color(  unsigned char red, unsigned char green,
-                unsigned char blue, unsigned char alpha):
+        Color(  unsigned int red, unsigned int green,
+                unsigned int blue, unsigned int alpha):
             red(red),
             green(green),
             blue(blue),
@@ -236,6 +239,11 @@ Color{ // TODO: change to float or half? - maybe template
         __device__ static Color
         Black(){
             return Color(0, 0, 0, 255);
+        }
+
+        __device__ Color
+        operator+(const Color& b) const{
+            return Color(red + b.red, green + b.green, blue + b.blue, alpha + b.alpha);
         }
 };
 
@@ -317,10 +325,10 @@ BlackHole {
 };
 
 __device__ void
-set_image_pixel(unsigned char * pixels, int i, int j, int output_width, Color color){
-    pixels[i * output_width * 3 + j * 3 + 0] = color.red;
-    pixels[i * output_width * 3 + j * 3 + 1] = color.green;
-    pixels[i * output_width * 3 + j * 3 + 2] = color.blue;
+set_image_pixel(unsigned char * output_pixels, int i, int j, int output_width, Color color){
+    output_pixels[i * output_width * 3 + j * 3 + 0] = color.red;
+    output_pixels[i * output_width * 3 + j * 3 + 1] = color.green;
+    output_pixels[i * output_width * 3 + j * 3 + 2] = color.blue;
 }
 
 __device__ float
@@ -341,13 +349,14 @@ extract_texture_color(cudaTextureObject_t texture_object, float i, float j, int 
 __global__ void // TODO: recycle variables, use scope operators to conserve register space
 ray(
 Camera camera,
-cudaTextureObject_t skybox_texture_object, unsigned char * pixels,
+cudaTextureObject_t skybox_texture_object, unsigned char * output_pixels,
 int output_width, int output_height,
 int skybox_width, int skybox_height,
 int grid_index, int block_size, // currently, even if ray is called as a "remainder" kernel with eg. <<<1920, 128>>>,
                                 // block_size is still passed as the block size of a "non-remainder" kernel, eg. 896
                                 // in order for the image coordinate arithmetic to be correct
-BlackHole * black_holes, int num_black_holes
+BlackHole * black_holes, int num_black_holes,
+bool anti_aliasing, bool dynamic_ray_resolution
 ){
     
     int i = blockIdx.x;
@@ -367,11 +376,29 @@ BlackHole * black_holes, int num_black_holes
     Vector new_velocity = Vector::Zero();
     constexpr float gravitational_constant = GRAVITATIONAL_CONSTANT;
     constexpr float ray_time_resolution = RAY_TIME_RESOLUTION;
-                                                /* to paint a pixel black, the ray has to be stuck */
-    int escape_sphere_radius = 5;               /* in a sphere of radius = escape_sphere_radius    */
-    Vector escape_sphere_center = old_position; /* centered in escape_sphere_center                */
-    int escape_sphere_iterations = 10;          /* for escape_sphere_iterations iterations         */                                         
-    for(int iter=0; iter<RAY_MAX_ITERATIONS; iter++){
+                                                                // to paint a pixel black, the ray has to be stuck
+    constexpr int escape_sphere_radius = ESCAPE_SPHERE_RADIUS;  // in a sphere of radius = escape_sphere_radius
+    Vector escape_sphere_center = old_position;                 // centered in escape_sphere_center
+    int escape_sphere_iterations = ESCAPE_SPHERE_ITERATIONS;    // for escape_sphere_iterations iterations
+
+    float min_angle_to_black_hole = ray_direction.angle(black_holes[0].position - camera.position);
+    for(int black_hole_index = 1; black_hole_index<num_black_holes; black_hole_index++){
+        float angle_to_black_hole = ray_direction.angle(black_holes[black_hole_index].position - camera.position);
+        if(angle_to_black_hole < min_angle_to_black_hole){
+            min_angle_to_black_hole = angle_to_black_hole;
+        }
+    }
+    float ray_resolution_multiplier = 1.f / ((min_angle_to_black_hole / 25.f) * (min_angle_to_black_hole / 25.f) + 1.f); // f(x) = 1/((x/25)^2 + 1) bell-like function
+    int ray_iterations;
+
+    if(dynamic_ray_resolution){  // rays that are passing closer to black holes will be computed with a higher resolution (steps)
+        ray_iterations = (int)(ray_resolution_multiplier * (float)RAY_MAX_ITERATIONS);
+    }
+    else{
+        ray_iterations = RAY_MAX_ITERATIONS;
+    }
+
+    for(int iter=0; iter<ray_iterations; iter++){ // TODO: replace with ray_iterations for better performance but decreased quality
         Vector resultant_force = Vector::Zero();
         for(int black_hole_index=0; black_hole_index<num_black_holes; black_hole_index++){ // TO STUDY?: extract to separate kernel
             Vector black_hole_position = black_holes[black_hole_index].position;
@@ -387,12 +414,12 @@ BlackHole * black_holes, int num_black_holes
             // the ray has escaped the sphere, reset the iteration counter and set
             // sphere center to new_position
             escape_sphere_center = new_position;
-            escape_sphere_iterations = 10;
+            escape_sphere_iterations = ESCAPE_SPHERE_ITERATIONS;
         }
         else{
             escape_sphere_iterations--;
             if(escape_sphere_iterations < 0){
-                set_image_pixel(pixels, i, j, output_width, Color::Black());
+                set_image_pixel(output_pixels, i, j, output_width, Color::Black());
                 return;
             }
         }
@@ -408,23 +435,49 @@ BlackHole * black_holes, int num_black_holes
 
     // TO STUDY: why did i need printf("") before?
 
-    float skybox_height_coordinate = elevation_angle / 180;
-    float skybox_width_coordinate  = azimuth_angle   / 360;
+    float skybox_height_coordinate = elevation_angle / 180.f;
+    float skybox_width_coordinate  = azimuth_angle   / 360.f;
 
-    Color skybox_color = extract_texture_color(skybox_texture_object, skybox_height_coordinate, skybox_width_coordinate, skybox_width);
+    Color skybox_color = Color(0, 0, 0, 255);
 
-    set_image_pixel(pixels, i, j, output_width, skybox_color); // TODO: shared mem
+    float epsilon = ray_resolution_multiplier / 7;
+    if(anti_aliasing){
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle - epsilon) / 180.f, (azimuth_angle - epsilon) / 360.f, skybox_width);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle - epsilon) / 180.f, (azimuth_angle -    0   ) / 360.f, skybox_width);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle - epsilon) / 180.f, (azimuth_angle + epsilon) / 360.f, skybox_width);
+    
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle - epsilon) / 360.f, skybox_width);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle -    0   ) / 360.f, skybox_width);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle + epsilon) / 360.f, skybox_width);
+
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle + epsilon) / 180.f, (azimuth_angle - epsilon) / 360.f, skybox_width);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle + epsilon) / 180.f, (azimuth_angle -    0   ) / 360.f, skybox_width);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle + epsilon) / 180.f, (azimuth_angle + epsilon) / 360.f, skybox_width);
+
+        skybox_color.red /= 9;
+        skybox_color.green /= 9;
+        skybox_color.blue /= 9;
+        skybox_color.alpha = 255;
+    }
+    else{
+        skybox_color = extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle -    0   ) / 360.f, skybox_width);
+    }
+
+    // TODO: merge into single function, maybe discard use of Color class
+    set_image_pixel(output_pixels, i, j, output_width, skybox_color); // TODO: shared mem
 }
 
 int
 main(int argc, char * argv[]){
-/*
-args:
-1 - output width
-2 - output height
-3 - field of view (degrees)
-4 - skybox filename, optional, must be an equirectangular image (2:1 aspect ratio), default: starmap_2020_2k_gal.png
-*/
+/************************************************************************************************************************
+ * args:                                                                                                                *
+ * 1 - output width                                                                                                     *
+ * 2 - output height                                                                                                    *
+ * 3 - field of view (degrees)                                                                                          *
+ * 4 - skybox filename, optional, must be an equirectangular image (2:1 aspect ratio), default: starmap_2020_2k_gal.png *
+ * 5 - anti-aliasing, optional, default = true                                                                          *
+ * 6 - dynamic ray resolution - faster but lower quality, introduces artifcts when close to black hole, default = false *
+ ************************************************************************************************************************/
     int output_width    = atoi(argv[1]);
     int output_height   = atoi(argv[2]);
     int field_of_view   = atoi(argv[3]);
@@ -440,7 +493,7 @@ args:
     constexpr float look_speed = 0.2f;    
 
     unsigned char * d_pixels;
-    unsigned char * h_pixels = (unsigned char *)malloc(output_width * output_height * 3 * sizeof(unsigned char)); // TODO: check if 3 or 4
+    unsigned char * h_pixels = (unsigned char *)malloc(output_width * output_height * 3 * sizeof(unsigned char));
     std::vector<unsigned char> h_skybox;
     unsigned int skybox_width   = UINT32_MAX;
     unsigned int skybox_height  = UINT32_MAX;
@@ -452,6 +505,32 @@ args:
     }
     else{
         skybox_filename += "starmap_2020_2k_gal.png";
+    }
+
+    bool anti_aliasing;
+    if(argc > 5){
+        if(strcmp(argv[5], "true") == 0){
+            anti_aliasing = true;
+        }
+        else{
+            anti_aliasing = false;
+        }
+    }
+    else{
+        anti_aliasing = true;
+    }
+
+    bool dynamic_ray_resolution;
+    if(argc > 6){
+        if(strcmp(argv[6], "true") == 0){
+            dynamic_ray_resolution = true;
+        }
+        else{
+            dynamic_ray_resolution = false;
+        }
+    }
+    else{
+        dynamic_ray_resolution = false;
     }
 
     cv::Mat skybox_matrix = cv::imread(skybox_filename);
@@ -560,7 +639,7 @@ args:
         // camera.position = Vector(std::cos(degrees_to_radians(angle)), 0, std::sin(degrees_to_radians(angle))) * camera_distance_from_center;
         // camera.direction = (Vector::Zero() - camera.position).normalize();
         // MOVE INTO CENTER:
-        // TODO: issue noticed when camera is at "perfect" integer coordinates, got CUDA error: an illegal memory access was encountered
+        // TODO: issue noticed when camera is at "perfect" integer coordinates, got CUDA error: an illegal memory access was encountered - NaN values?
         // camera.position = camera.position + camera.direction / 2;
 
         int remaining_width = output_width;
@@ -574,10 +653,10 @@ args:
         auto frame_start = std::chrono::high_resolution_clock::now();
         while(remaining_width > 0){
             if(remaining_width >= threads_per_block){
-                ray<<<output_height, threads_per_block>>>(camera, skybox_texture_object, d_pixels, output_width, output_height, skybox_width, skybox_height, grid_index, threads_per_block, d_black_holes, num_black_holes);
+                ray<<<output_height, threads_per_block>>>(camera, skybox_texture_object, d_pixels, output_width, output_height, skybox_width, skybox_height, grid_index, threads_per_block, d_black_holes, num_black_holes, anti_aliasing, dynamic_ray_resolution);
             }
             else{ // remainder kernel call
-                ray<<<output_height, remaining_width>>>(camera, skybox_texture_object, d_pixels, output_width, output_height, skybox_width, skybox_height, grid_index, threads_per_block, d_black_holes, num_black_holes);                
+                ray<<<output_height, remaining_width>>>(camera, skybox_texture_object, d_pixels, output_width, output_height, skybox_width, skybox_height, grid_index, threads_per_block, d_black_holes, num_black_holes, anti_aliasing, dynamic_ray_resolution);                
             }
             cudaError_t cudaError = cudaGetLastError();
             if (cudaError != cudaSuccess) {
@@ -677,9 +756,9 @@ args:
         // if(black_hole_distance < 0){
         //     break;
         // }
-        // h_black_holes.clear();
-        // h_black_holes.push_back(BlackHole(1000, Vector(0, 0, 0)));
-        // h_black_holes.push_back(BlackHole(500, Vector(0, 0, black_hole_distance)));
+        h_black_holes.clear();
+        h_black_holes.push_back(BlackHole(500, Vector(0, 0, 0)));
+        h_black_holes.push_back(BlackHole(500, Vector(0, 0, clip(40.f - angle/64.f, 0, 40))));
         
         cudaHandleError(cudaMemcpy(d_black_holes, h_black_holes.data(), h_black_holes.size() * sizeof(BlackHole), cudaMemcpyHostToDevice));
         auto other_end = std::chrono::high_resolution_clock::now();
