@@ -23,7 +23,7 @@
 #define GRAVITATIONAL_CONSTANT 6.674e-3f // real gravitational constant is 6.674e-11
 #define RAY_TIME_RESOLUTION 1 // time between two ray positions when computing gravitational lensing
 #define ESCAPE_SPHERE_ITERATIONS 10
-#define ESCAPE_SPHERE_RADIUS 5
+#define ESCAPE_SPHERE_RADIUS 2
 
 //TODO: change dynamically based on distance to closest BH
 #define RAY_MAX_ITERATIONS 100 // maximum amount of ray positions computed per pixel
@@ -95,10 +95,10 @@ Vector{ // TODO: change to float or half? - maybe template
             return Vector(x, y, z);
         }
 
-        // projection of vector b onto vector a
+        // projection of vector a onto vector b
         __device__ __host__ static Vector
         projection(Vector a, Vector b){
-            return b * ((a * b) / b.length()); 
+            return b * ((a * b) / b.length_2()); 
         }
 
         // Rodrigues' rotation formula
@@ -336,10 +336,15 @@ image_to_view_plane(int n, int img_size, float view_plane_size){
     return - n * view_plane_size / img_size + view_plane_size / 2;
 }
 
+__device__ float
+sinf_kernel(float x){
+    return std::sinf(x);
+}
+
 __device__ Color
-extract_texture_color(cudaTextureObject_t texture_object, float i, float j, int skybox_width){
+extract_texture_color(cudaTextureObject_t texture_object, float i, float j){
     return Color(
-        tex2D<float4>(texture_object, j, i).x, // TODO: try with memcpy
+        tex2D<float4>(texture_object, j, i).x,
         tex2D<float4>(texture_object, j, i).y,
         tex2D<float4>(texture_object, j, i).z,
         0
@@ -349,14 +354,16 @@ extract_texture_color(cudaTextureObject_t texture_object, float i, float j, int 
 __global__ void // TODO: recycle variables, use scope operators to conserve register space
 ray(
 Camera camera,
-cudaTextureObject_t skybox_texture_object, unsigned char * output_pixels,
+cudaTextureObject_t skybox_texture_object,
 int output_width, int output_height,
-int skybox_width, int skybox_height,
 int grid_index, int block_size, // currently, even if ray is called as a "remainder" kernel with eg. <<<1920, 128>>>,
                                 // block_size is still passed as the block size of a "non-remainder" kernel, eg. 896
                                 // in order for the image coordinate arithmetic to be correct
 BlackHole * black_holes, int num_black_holes,
-bool anti_aliasing, bool dynamic_ray_resolution
+bool anti_aliasing, bool dynamic_ray_resolution,
+// int frames_processed, // for experimental effects based on frame number
+float * d_ray_direction_vector_map,
+float * d_ray_resolution_multiplier_map
 ){
     
     int i = blockIdx.x;
@@ -375,28 +382,58 @@ bool anti_aliasing, bool dynamic_ray_resolution
     Vector new_position = Vector::Zero();
     Vector new_velocity = Vector::Zero();
     constexpr float gravitational_constant = GRAVITATIONAL_CONSTANT;
-    constexpr float ray_time_resolution = RAY_TIME_RESOLUTION;
                                                                 // to paint a pixel black, the ray has to be stuck
-    constexpr int escape_sphere_radius = ESCAPE_SPHERE_RADIUS;  // in a sphere of radius = escape_sphere_radius
+    int escape_sphere_radius = ESCAPE_SPHERE_RADIUS;  // in a sphere of radius = escape_sphere_radius
     Vector escape_sphere_center = old_position;                 // centered in escape_sphere_center
     int escape_sphere_iterations = ESCAPE_SPHERE_ITERATIONS;    // for escape_sphere_iterations iterations
 
-    float min_angle_to_black_hole = ray_direction.angle(black_holes[0].position - camera.position);
-    for(int black_hole_index = 1; black_hole_index<num_black_holes; black_hole_index++){
-        float angle_to_black_hole = ray_direction.angle(black_holes[black_hole_index].position - camera.position);
-        if(angle_to_black_hole < min_angle_to_black_hole){
-            min_angle_to_black_hole = angle_to_black_hole;
+    bool ray_going_opposite = true;
+    float min_impact_parameter = (black_holes[0].position - camera.position).length();
+    float average_distance = 0;
+    float min_distance = min_impact_parameter;
+    for(int black_hole_index = 0; black_hole_index<num_black_holes; black_hole_index++){
+        Vector camera_to_black_hole = (black_holes[black_hole_index].position - camera.position);
+        Vector ray_to_black_hole_projection = Vector::projection(ray_direction, camera_to_black_hole);
+        float impact_parameter;
+        if(!((camera_to_black_hole + ray_to_black_hole_projection).length() < camera_to_black_hole.length())){
+            ray_going_opposite = false;
+        }
+        impact_parameter = (ray_direction - ray_to_black_hole_projection).length();
+        if(impact_parameter < min_impact_parameter){
+            min_impact_parameter = impact_parameter;
+        }
+        
+        average_distance += camera_to_black_hole.length();
+        
+        if(camera_to_black_hole.length() < min_distance){
+            min_distance = camera_to_black_hole.length();
         }
     }
-    float ray_resolution_multiplier = 1.f / ((min_angle_to_black_hole / 25.f) * (min_angle_to_black_hole / 25.f) + 1.f); // f(x) = 1/((x/25)^2 + 1) bell-like function
-    int ray_iterations;
-
-    if(dynamic_ray_resolution){  // rays that are passing closer to black holes will be computed with a higher resolution (steps)
-        ray_iterations = (int)(ray_resolution_multiplier * (float)RAY_MAX_ITERATIONS);
+    average_distance /= num_black_holes;
+    
+    // TODO: parameterize the impact parameter multiplier
+    float ray_resolution_multiplier = 1.f / ((min_impact_parameter /* TODO times impact parameter multiplier*/) * (min_impact_parameter /* TODO times impact parameter multiplier*/) + 1.f); // f(x) = 1/((x/25)^2 + 1) bell-like function    
+    if(ray_going_opposite){ // TODO: find better solution
+        d_ray_resolution_multiplier_map[i * output_width + j] = 0; // so that anti-aliasing doesnt blur the skybox opposite to black holes 
     }
     else{
+        d_ray_resolution_multiplier_map[i * output_width + j] = ray_resolution_multiplier;
+    }
+    float ray_time_resolution;
+    int ray_iterations;
+    
+    if(dynamic_ray_resolution){  // rays that are passing closer to black holes will be computed with a higher resolution (steps)
+        ray_time_resolution = 1.f / ray_resolution_multiplier;
+        ray_iterations = ((int)(ray_resolution_multiplier * (float)RAY_MAX_ITERATIONS) > 1) ?
+                         ((int)(ray_resolution_multiplier * (float)RAY_MAX_ITERATIONS)) :
+                         (1);
+    }
+    else{
+        ray_time_resolution = RAY_TIME_RESOLUTION;
         ray_iterations = RAY_MAX_ITERATIONS;
     }
+
+    escape_sphere_radius *= ray_time_resolution;
 
     for(int iter=0; iter<ray_iterations; iter++){ // TODO: replace with ray_iterations for better performance but decreased quality
         Vector resultant_force = Vector::Zero();
@@ -405,10 +442,15 @@ bool anti_aliasing, bool dynamic_ray_resolution
             float black_hole_mass = black_holes[black_hole_index].mass;
             float r_squared = (black_hole_position - old_position).length_2();
             Vector r_hat = (black_hole_position - old_position).normalize();
-            resultant_force += r_hat * gravitational_constant * black_hole_mass / r_squared;
+            resultant_force += r_hat * gravitational_constant * black_hole_mass * 2 / r_squared;
+
+            // spin experiment
+            // resultant_force += ((old_position - black_holes[black_hole_index].position).normalize() ^ Vector::North()) / (old_position - black_holes[black_hole_index].position).length_2();
         }
-        new_velocity = (old_velocity + resultant_force * ray_time_resolution).normalize() * old_velocity.length();
-        new_position = old_position + new_velocity * ray_time_resolution;
+        average_distance /= 2; // binary search-like ray
+        average_distance = average_distance > 1.f ? average_distance : 1.f;
+        new_velocity = (old_velocity + resultant_force * average_distance).normalize() * old_velocity.length();
+        new_position = old_position + new_velocity * average_distance;
 
         if((new_position - escape_sphere_center).length() > escape_sphere_radius){
             // the ray has escaped the sphere, reset the iteration counter and set
@@ -419,7 +461,9 @@ bool anti_aliasing, bool dynamic_ray_resolution
         else{
             escape_sphere_iterations--;
             if(escape_sphere_iterations < 0){
-                set_image_pixel(output_pixels, i, j, output_width, Color::Black());
+                d_ray_direction_vector_map[i * output_width * 3 + j * 3 + 0] = 0.f;
+                d_ray_direction_vector_map[i * output_width * 3 + j * 3 + 1] = 0.f;
+                d_ray_direction_vector_map[i * output_width * 3 + j * 3 + 2] = 0.f;            
                 return;
             }
         }
@@ -428,31 +472,85 @@ bool anti_aliasing, bool dynamic_ray_resolution
         old_position = new_position;
     }
     ray_direction = new_velocity;
-    
+
+    d_ray_direction_vector_map[i * output_width * 3 + j * 3 + 0] = ray_direction.x;
+    d_ray_direction_vector_map[i * output_width * 3 + j * 3 + 1] = ray_direction.y;
+    d_ray_direction_vector_map[i * output_width * 3 + j * 3 + 2] = ray_direction.z;
+}
+
+__global__ void
+ray_post_processing(
+float * d_ray_direction_vector_map, float * d_output_ray_direction_vector_map,
+int grid_index,
+float * d_gaussian_kernel, int gaussian_kernel_size,
+int block_size, int output_width, int output_height
+){
+    int i = blockIdx.x;
+    int j = threadIdx.x + grid_index * block_size;
+
+    Vector sum = Vector::Zero();
+    for(int n = 0; n < gaussian_kernel_size; n++){
+        for(int m = 0; m < gaussian_kernel_size; m++){
+            sum += Vector(
+                d_ray_direction_vector_map[(int)clip(i - gaussian_kernel_size/2 + n, 0, output_height-1) * output_width * 3 + (int)clip(j - gaussian_kernel_size/2 + m, 0, output_width-1) * 3 + 0],
+                d_ray_direction_vector_map[(int)clip(i - gaussian_kernel_size/2 + n, 0, output_height-1) * output_width * 3 + (int)clip(j - gaussian_kernel_size/2 + m, 0, output_width-1) * 3 + 1],
+                d_ray_direction_vector_map[(int)clip(i - gaussian_kernel_size/2 + n, 0, output_height-1) * output_width * 3 + (int)clip(j - gaussian_kernel_size/2 + m, 0, output_width-1) * 3 + 2]
+            ) * d_gaussian_kernel[n * gaussian_kernel_size + m];
+        }
+    }
+
+    d_output_ray_direction_vector_map[i * output_width * 3 + j * 3 + 0] = sum.x;
+    d_output_ray_direction_vector_map[i * output_width * 3 + j * 3 + 1] = sum.y;
+    d_output_ray_direction_vector_map[i * output_width * 3 + j * 3 + 2] = sum.z;
+}
+
+__global__ void
+skybox_texture_extraction(
+cudaTextureObject_t skybox_texture_object,
+float * d_output_ray_direction_vector_map,
+float * d_ray_resolution_multiplier_map,
+unsigned char * output_pixels,
+int grid_index, int block_size,
+bool anti_aliasing,
+int output_width
+){
+    int i = blockIdx.x;
+    int j = threadIdx.x + grid_index * block_size;
+
+    Vector ray_direction = Vector(
+        d_output_ray_direction_vector_map[i * output_width * 3 + j * 3 + 0],
+        d_output_ray_direction_vector_map[i * output_width * 3 + j * 3 + 1],
+        d_output_ray_direction_vector_map[i * output_width * 3 + j * 3 + 2]
+    );
+    if(ray_direction.x == 0.f && ray_direction.y == 0.f && ray_direction.z == 0.f){ // ray did not escape black hole
+        set_image_pixel(output_pixels, i, j, output_width, Color::Black());
+        return;    
+    }
+
+    float ray_resolution_multiplier = d_ray_resolution_multiplier_map[i * output_width + j];
+
     // skybox rendering
     float elevation_angle = Vector::Up().angle(ray_direction); // 0 degrees <=> straight up, 180 degress <=> straight down
     float azimuth_angle = ray_direction.azimuth_angle_on_xOz();
 
-    // TO STUDY: why did i need printf("") before?
-
-    float skybox_height_coordinate = elevation_angle / 180.f;
-    float skybox_width_coordinate  = azimuth_angle   / 360.f;
+    // float skybox_height_coordinate = elevation_angle / 180.f;
+    // float skybox_width_coordinate  = azimuth_angle   / 360.f;
 
     Color skybox_color = Color(0, 0, 0, 255);
 
     float epsilon = ray_resolution_multiplier / 7;
     if(anti_aliasing){
-        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle - epsilon) / 180.f, (azimuth_angle - epsilon) / 360.f, skybox_width);
-        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle - epsilon) / 180.f, (azimuth_angle -    0   ) / 360.f, skybox_width);
-        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle - epsilon) / 180.f, (azimuth_angle + epsilon) / 360.f, skybox_width);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle - epsilon) / 180.f, (azimuth_angle - epsilon) / 360.f);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle - epsilon) / 180.f, (azimuth_angle -    0   ) / 360.f);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle - epsilon) / 180.f, (azimuth_angle + epsilon) / 360.f);
     
-        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle - epsilon) / 360.f, skybox_width);
-        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle -    0   ) / 360.f, skybox_width);
-        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle + epsilon) / 360.f, skybox_width);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle - epsilon) / 360.f);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle -    0   ) / 360.f);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle + epsilon) / 360.f);
 
-        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle + epsilon) / 180.f, (azimuth_angle - epsilon) / 360.f, skybox_width);
-        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle + epsilon) / 180.f, (azimuth_angle -    0   ) / 360.f, skybox_width);
-        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle + epsilon) / 180.f, (azimuth_angle + epsilon) / 360.f, skybox_width);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle + epsilon) / 180.f, (azimuth_angle - epsilon) / 360.f);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle + epsilon) / 180.f, (azimuth_angle -    0   ) / 360.f);
+        skybox_color = skybox_color + extract_texture_color(skybox_texture_object, (elevation_angle + epsilon) / 180.f, (azimuth_angle + epsilon) / 360.f);
 
         skybox_color.red /= 9;
         skybox_color.green /= 9;
@@ -460,25 +558,52 @@ bool anti_aliasing, bool dynamic_ray_resolution
         skybox_color.alpha = 255;
     }
     else{
-        skybox_color = extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle -    0   ) / 360.f, skybox_width);
+        skybox_color = extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle -    0   ) / 360.f);
     }
 
     // TODO: merge into single function, maybe discard use of Color class
     set_image_pixel(output_pixels, i, j, output_width, skybox_color); // TODO: shared mem
 }
 
+std::vector<std::vector<float>> generate_gaussian_kernel(int size, float sigma) {
+    std::vector<std::vector<float>> kernel(size, std::vector<float>(size));
+    float sum = 0.0;
+
+    // Calculate normalization factor
+    float normFactor = 1.0f / (2 * PI * sigma * sigma);
+
+    // Generate kernel values
+    for (int i = 0; i < size; ++i) {
+        for (int j = 0; j < size; ++j) {
+            int x = i - size / 2;
+            int y = j - size / 2;
+            kernel[i][j] = normFactor * exp(-(x * x + y * y) / (2 * sigma * sigma));
+            sum += kernel[i][j];
+        }
+    }
+
+    // Normalize kernel
+    for (int i = 0; i < size; ++i) {
+        for (int j = 0; j < size; ++j) {
+            kernel[i][j] /= sum;
+        }
+    }
+
+    return kernel;
+}
+
 int
 main(int argc, char * argv[]){
-/************************************************************************************************************************
- * args:                                                                                                                *
- * 1 - output width                                                                                                     *
- * 2 - output height                                                                                                    *
- * 3 - field of view (degrees)                                                                                          *
- * 4 - skybox filename, optional, must be an equirectangular image (2:1 aspect ratio), default: starmap_2020_2k_gal.png *
- * 5 - anti-aliasing, optional, default = true                                                                          *
- * 6 - dynamic ray resolution - faster but lower quality, introduces artifcts when close to black hole, default = false *
- ************************************************************************************************************************/
-    int output_width    = atoi(argv[1]);
+/**************************************************************************************************************************************
+ * args:                                                                                                                              *
+ * 1 - output width                                                                                                                   *
+ * 2 - output height                                                                                                                  *
+ * 3 - field of view (degrees)                                                                                                        *
+ * 4 - skybox filename, optional, must be an equirectangular image (2:1 aspect ratio), default: starmap_2020_2k_gal.png               *
+ * 5 - anti-aliasing, optional, default = true                                                                                        *
+ * 6 - dynamic ray resolution - wether rays will have a variable number of iterations, based on the impact parameter, default = false *
+ **************************************************************************************************************************************/
+    int output_width    = atoi(argv[1]); // TODO: check argc
     int output_height   = atoi(argv[2]);
     int field_of_view   = atoi(argv[3]);
     Vector camera_position  = Vector::Zero();
@@ -493,6 +618,8 @@ main(int argc, char * argv[]){
     constexpr float look_speed = 0.2f;    
 
     unsigned char * d_pixels;
+    float * d_ray_direction_vector_map;
+    float * d_output_ray_direction_vector_map;
     unsigned char * h_pixels = (unsigned char *)malloc(output_width * output_height * 3 * sizeof(unsigned char));
     std::vector<unsigned char> h_skybox;
     unsigned int skybox_width   = UINT32_MAX;
@@ -524,6 +651,7 @@ main(int argc, char * argv[]){
     if(argc > 6){
         if(strcmp(argv[6], "true") == 0){
             dynamic_ray_resolution = true;
+
         }
         else{
             dynamic_ray_resolution = false;
@@ -532,6 +660,52 @@ main(int argc, char * argv[]){
     else{
         dynamic_ray_resolution = false;
     }
+
+    int gaussian_kernel_size;
+    if(argc > 7){
+        if(atoi(argv[7]) != 0){
+            gaussian_kernel_size = atoi(argv[7]);
+        }
+        else{
+            gaussian_kernel_size = 5;
+            printf("Using default gaussian kernel size 5\n");
+        }
+
+        if(gaussian_kernel_size % 2 == 0){
+            gaussian_kernel_size++;
+        }
+    }
+    else{
+        gaussian_kernel_size = 5;
+        printf("Using default gaussian kernel size 5\n");
+    }
+
+    float gaussian_kernel_sigma;
+    if(argc > 8){
+        if(atof(argv[8]) != 0){
+            gaussian_kernel_sigma = (float)atof(argv[8]);
+        }
+        else{
+            gaussian_kernel_sigma = 1.f;
+            printf("Using default gaussian kernel sigma 1.0\n");
+        }
+    }
+    else{
+        gaussian_kernel_sigma = 1.f;
+        printf("Using default gaussian kernel sigma 1.0\n");
+    }
+
+    float * h_gaussian_kernel = (float *)malloc(gaussian_kernel_size * gaussian_kernel_size * sizeof(float));
+    std::vector<std::vector<float>> gaussian_kernel_matrix = generate_gaussian_kernel(gaussian_kernel_size, gaussian_kernel_sigma);
+    for(int i = 0; i < gaussian_kernel_size; i++){
+        memcpy((h_gaussian_kernel + i * gaussian_kernel_size), gaussian_kernel_matrix[i].data(), gaussian_kernel_size * sizeof(float));
+    }
+    float * d_gaussian_kernel;
+    cudaHandleError(cudaMalloc((void **)&d_gaussian_kernel, gaussian_kernel_size * gaussian_kernel_size * sizeof(float)));
+    cudaHandleError(cudaMemcpy(d_gaussian_kernel, h_gaussian_kernel, gaussian_kernel_size * gaussian_kernel_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    float * d_ray_resolution_multiplier_map;
+    cudaHandleError(cudaMalloc((void **)&d_ray_resolution_multiplier_map, output_width * output_height * sizeof(float)));
 
     cv::Mat skybox_matrix = cv::imread(skybox_filename);
     if(skybox_matrix.empty()){
@@ -584,6 +758,8 @@ main(int argc, char * argv[]){
     cudaHandleError(cudaMalloc((void **)&d_pixels, output_width * output_height * 3 * sizeof(unsigned char))); // TODO: mallocManaged?
     cudaHandleError(cudaMalloc((void **)&d_black_holes, num_black_holes * sizeof(BlackHole))); // TODO: mallocManaged?
     cudaHandleError(cudaMemcpy(d_black_holes, h_black_holes.data(), num_black_holes * sizeof(BlackHole), cudaMemcpyHostToDevice));
+    cudaHandleError(cudaMalloc((void **)&d_ray_direction_vector_map, output_width * output_height * 3 * sizeof(float)));
+    cudaHandleError(cudaMalloc((void **)&d_output_ray_direction_vector_map, output_width * output_height * 3 * sizeof(float)));
 
     // initialize GLFW
     GLFWwindow* main_window;
@@ -653,20 +829,64 @@ main(int argc, char * argv[]){
         auto frame_start = std::chrono::high_resolution_clock::now();
         while(remaining_width > 0){
             if(remaining_width >= threads_per_block){
-                ray<<<output_height, threads_per_block>>>(camera, skybox_texture_object, d_pixels, output_width, output_height, skybox_width, skybox_height, grid_index, threads_per_block, d_black_holes, num_black_holes, anti_aliasing, dynamic_ray_resolution);
+                ray<<<output_height, threads_per_block>>>(camera, skybox_texture_object, output_width, output_height, grid_index, threads_per_block, d_black_holes, num_black_holes, anti_aliasing, dynamic_ray_resolution, /*frames_processed,*/ d_ray_direction_vector_map, d_ray_resolution_multiplier_map);
             }
             else{ // remainder kernel call
-                ray<<<output_height, remaining_width>>>(camera, skybox_texture_object, d_pixels, output_width, output_height, skybox_width, skybox_height, grid_index, threads_per_block, d_black_holes, num_black_holes, anti_aliasing, dynamic_ray_resolution);                
+                ray<<<output_height, remaining_width>>>(camera, skybox_texture_object, output_width, output_height, grid_index, threads_per_block, d_black_holes, num_black_holes, anti_aliasing, dynamic_ray_resolution, /*frames_processed,*/ d_ray_direction_vector_map, d_ray_resolution_multiplier_map);                
             }
             cudaError_t cudaError = cudaGetLastError();
             if (cudaError != cudaSuccess) {
-                fprintf(stderr, "CUDA error line 468: %s: %s\n", cudaGetErrorName(cudaError), cudaGetErrorString(cudaError));
+                fprintf(stderr, "CUDA error line %d: %s: %s\n", __LINE__, cudaGetErrorName(cudaError), cudaGetErrorString(cudaError));
                 exit(1);
             }
             remaining_width -= threads_per_block;
             grid_index++;
         }
         cudaDeviceSynchronize();
+        
+        if(dynamic_ray_resolution){
+            remaining_width = output_width;
+            grid_index = 0;
+            while(remaining_width > 0){
+                if(remaining_width >= threads_per_block){
+                    ray_post_processing<<<output_height, threads_per_block>>>(d_ray_direction_vector_map, d_output_ray_direction_vector_map, grid_index, d_gaussian_kernel, gaussian_kernel_size, threads_per_block, output_width, output_height);
+                }
+                else{
+                    ray_post_processing<<<output_height, remaining_width>>>(d_ray_direction_vector_map, d_output_ray_direction_vector_map, grid_index, d_gaussian_kernel, gaussian_kernel_size, threads_per_block, output_width, output_height);
+                }
+                cudaError_t cudaError = cudaGetLastError();
+                if (cudaError != cudaSuccess) {
+                    fprintf(stderr, "CUDA error line %d: %s: %s\n", __LINE__, cudaGetErrorName(cudaError), cudaGetErrorString(cudaError));
+                    exit(1);
+                }
+                remaining_width -= threads_per_block;
+                grid_index++;
+            }
+        }
+        else{
+            cudaHandleError(cudaMemcpy(d_output_ray_direction_vector_map, d_ray_direction_vector_map, output_width * output_height * 3 * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
+        cudaDeviceSynchronize();
+
+        remaining_width = output_width;
+        grid_index = 0;
+        while(remaining_width > 0){
+            if(remaining_width >= threads_per_block){
+                skybox_texture_extraction<<<output_height, threads_per_block>>>(skybox_texture_object, d_output_ray_direction_vector_map, d_ray_resolution_multiplier_map, d_pixels, grid_index, threads_per_block, anti_aliasing, output_width);
+            }
+            else{
+                skybox_texture_extraction<<<output_height, remaining_width>>>(skybox_texture_object, d_output_ray_direction_vector_map, d_ray_resolution_multiplier_map, d_pixels, grid_index, threads_per_block, anti_aliasing, output_width); 
+            }
+            cudaError_t cudaError = cudaGetLastError();
+            if (cudaError != cudaSuccess) {
+                fprintf(stderr, "CUDA error line %d: %s: %s\n", __LINE__, cudaGetErrorName(cudaError), cudaGetErrorString(cudaError));
+                exit(1);
+            }
+            remaining_width -= threads_per_block;
+            grid_index++;
+        }
+        cudaDeviceSynchronize();
+
         auto frame_end = std::chrono::high_resolution_clock::now();
         float frame_duration = std::chrono::duration<float, std::milli>(frame_end - frame_start).count();
         printf("frame%03d time: %f\n", (int)(angle*2.), frame_duration);
@@ -674,7 +894,7 @@ main(int argc, char * argv[]){
         auto other_start = std::chrono::high_resolution_clock::now();
         cudaError_t cudaError = cudaGetLastError();
         if (cudaError != cudaSuccess) {
-            fprintf(stderr, "CUDA error line 477: %s: %s\n", cudaGetErrorName(cudaError), cudaGetErrorString(cudaError));
+            fprintf(stderr, "CUDA error line %d: %s: %s\n", __LINE__, cudaGetErrorName(cudaError), cudaGetErrorString(cudaError));
             exit(1);
         }
 
