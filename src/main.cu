@@ -341,10 +341,11 @@ sinf_kernel(float x){
 
 __device__ Color
 extract_texture_color(cudaTextureObject_t texture_object, float i, float j){
+    float4 color_data = tex2D<float4>(texture_object, j, i);
     return Color(
-        tex2D<float4>(texture_object, j, i).x,
-        tex2D<float4>(texture_object, j, i).y,
-        tex2D<float4>(texture_object, j, i).z,
+        color_data.x,
+        color_data.y,
+        color_data.z,
         0
     );
 }
