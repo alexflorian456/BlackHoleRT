@@ -19,7 +19,7 @@ set_property(TARGET ${CMAKE_PROJECT_NAME} PROPERTY CUDA_ARCHITECTURES 86)
 set_target_properties( ${CMAKE_PROJECT_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_compile_options(${CMAKE_PROJECT_NAME}
     PRIVATE $<$<COMPILE_LANGUAGE:CXX>: >
-    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>: --verbose -Xcudafe --diag_suppress=esa_on_defaulted_function_ignored --expt-relaxed-constexpr>
+    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>: --verbose -Xcudafe --diag_suppress=esa_on_defaulted_function_ignored --expt-relaxed-constexpr −Xptxas −v>
 )
 
 find_package(OpenCV REQUIRED)

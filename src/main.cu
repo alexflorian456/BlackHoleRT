@@ -11,6 +11,7 @@
 #include <cuda_runtime_api.h>
 #include <cuda_texture_types.h>
 #include <cuda_fp16.h>
+// #include <cuda_gl_interop.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -26,6 +27,12 @@
 #define ESCAPE_SPHERE_RADIUS 5
 
 #define RAY_MAX_ITERATIONS 50 // maximum amount of ray positions computed per pixel
+#define MAX_VECTOR_KERNEL_SIZE 127
+
+#define MIN_ACCRETION_DISK_DISTANCE 30
+#define MAX_ACCRETION_DISK_DISTANCE 70
+
+__constant__ float vector_conv_kernel[MAX_VECTOR_KERNEL_SIZE * MAX_VECTOR_KERNEL_SIZE];
 
 void cudaHandleError(cudaError_t cudaResult){ // TODO: (low priority) convert to macro
     if (cudaResult != cudaSuccess) {
@@ -244,6 +251,11 @@ Color{
         operator+(const Color& b) const{
             return Color(red + b.red, green + b.green, blue + b.blue, alpha + b.alpha);
         }
+
+        __device__ Color
+        operator*(const float& c) const{
+            return Color(red * c, green * c, blue * c, alpha * c);
+        }
 };
 
 class
@@ -357,7 +369,7 @@ cauchy_bell(float x, float c){
 __global__ void // TODO: recycle variables, use scope operators to conserve register space
 ray(
 Camera camera,
-cudaTextureObject_t skybox_texture_object,
+cudaTextureObject_t accretion_disk_texture_object,
 int output_width, int output_height,
 int grid_index, int block_size, // currently, even if ray is called as a "remainder" kernel with eg. <<<1920, 128>>>,
                                 // block_size is still passed as the block size of a "non-remainder" kernel, eg. 896
@@ -366,7 +378,8 @@ BlackHole * black_holes, int num_black_holes,
 bool anti_aliasing, bool dynamic_ray_resolution,
 int frames_processed, // for experimental effects based on frame number
 float * d_ray_direction_vector_map,
-float * d_ray_resolution_multiplier_map
+float * d_ray_resolution_multiplier_map,
+unsigned char * d_accretion_disk_intersection
 ){
     
     int i = blockIdx.x;
@@ -386,7 +399,7 @@ float * d_ray_resolution_multiplier_map
     Vector new_velocity = Vector::Zero();
     constexpr float gravitational_constant = GRAVITATIONAL_CONSTANT;
                                                                 // to paint a pixel black, the ray has to be stuck
-    int escape_sphere_radius = ESCAPE_SPHERE_RADIUS;  // in a sphere of radius = escape_sphere_radius
+    int escape_sphere_radius = ESCAPE_SPHERE_RADIUS;            // in a sphere of radius = escape_sphere_radius
     Vector escape_sphere_center = old_position;                 // centered in escape_sphere_center
     int escape_sphere_iterations = ESCAPE_SPHERE_ITERATIONS;    // for escape_sphere_iterations iterations
 
@@ -436,6 +449,11 @@ float * d_ray_resolution_multiplier_map
 
     // escape_sphere_radius *= ray_time_resolution;
     // ray_travel_distance *= ray_time_resolution;
+    bool intersected_accretion_disk = false;
+    if(!intersected_accretion_disk){
+        set_image_pixel(d_accretion_disk_intersection, i, j, output_width, Color::Black());
+    }
+    
 
     for(int iter=0; iter<ray_iterations; iter++){
         Vector resultant_force = Vector::Zero();
@@ -480,6 +498,23 @@ float * d_ray_resolution_multiplier_map
             }
         }
 
+        if(old_position.y * new_position.y < 0 && !intersected_accretion_disk){
+            float accretion_disk_intersection_t = (-old_position.y)/(new_position.y - old_position.y);
+            Vector accretion_disk_intersection_position = Vector(
+                old_position.x + accretion_disk_intersection_t * (new_position.x - old_position.x),
+                old_position.y + accretion_disk_intersection_t * (new_position.y - old_position.y),
+                old_position.z + accretion_disk_intersection_t * (new_position.z - old_position.z)
+            );
+            if(accretion_disk_intersection_position.length() > MIN_ACCRETION_DISK_DISTANCE && accretion_disk_intersection_position.length() < MAX_ACCRETION_DISK_DISTANCE){
+                float accretion_disk_texture_position_y = (accretion_disk_intersection_position.length() - MIN_ACCRETION_DISK_DISTANCE)/(MAX_ACCRETION_DISK_DISTANCE - MIN_ACCRETION_DISK_DISTANCE);
+                float accretion_disk_texture_position_x = (int)(accretion_disk_intersection_position.azimuth_angle_on_xOz() + frames_processed) % 360 / 360.f;
+
+                Color accretion_disk_color = extract_texture_color(accretion_disk_texture_object, accretion_disk_texture_position_x, accretion_disk_texture_position_y);
+                set_image_pixel(d_accretion_disk_intersection, i, j, output_width, accretion_disk_color);
+                intersected_accretion_disk = true;
+            }
+        }
+
         old_velocity = new_velocity;
         old_position = new_position;
     }
@@ -494,7 +529,7 @@ __global__ void
 ray_post_processing(
 float * d_ray_direction_vector_map, float * d_output_ray_direction_vector_map,
 int grid_index,
-float * d_gaussian_kernel, int gaussian_kernel_size,
+int gaussian_kernel_size,
 int block_size, int output_width, int output_height
 ){
     int i = blockIdx.x;
@@ -516,7 +551,7 @@ int block_size, int output_width, int output_height
                 d_ray_direction_vector_map[(int)clip(i - gaussian_kernel_size/2 + n, 0, output_height-1) * output_width * 3 + (int)clip(j - gaussian_kernel_size/2 + m, 0, output_width-1) * 3 + 0],
                 d_ray_direction_vector_map[(int)clip(i - gaussian_kernel_size/2 + n, 0, output_height-1) * output_width * 3 + (int)clip(j - gaussian_kernel_size/2 + m, 0, output_width-1) * 3 + 1],
                 d_ray_direction_vector_map[(int)clip(i - gaussian_kernel_size/2 + n, 0, output_height-1) * output_width * 3 + (int)clip(j - gaussian_kernel_size/2 + m, 0, output_width-1) * 3 + 2]
-            ) * d_gaussian_kernel[n * gaussian_kernel_size + m];
+            ) * vector_conv_kernel[n * gaussian_kernel_size + m];
         }
     }
 
@@ -533,10 +568,27 @@ float * d_ray_resolution_multiplier_map,
 unsigned char * output_pixels,
 int grid_index, int block_size,
 bool anti_aliasing,
-int output_width
+int output_width,
+unsigned char * d_accretion_disk_intersection
 ){
     int i = blockIdx.x;
     int j = threadIdx.x + grid_index * block_size;
+
+    Color accretion_disk_intersection_color = Color(
+        d_accretion_disk_intersection[i * output_width * 3 + j * 3 + 0],
+        d_accretion_disk_intersection[i * output_width * 3 + j * 3 + 1],
+        d_accretion_disk_intersection[i * output_width * 3 + j * 3 + 2],
+        0
+    );
+    bool return_if_ray_did_not_escape = true;
+
+    if( accretion_disk_intersection_color.red != 0 ||
+        accretion_disk_intersection_color.green != 0 ||
+        accretion_disk_intersection_color.blue != 0){ // ray intersected accretion disk
+        
+        // set_image_pixel(output_pixels, i, j, output_width, accretion_disk_intersection_color);
+        return_if_ray_did_not_escape = false;
+    }
 
     Vector ray_direction = Vector(
         d_output_ray_direction_vector_map[i * output_width * 3 + j * 3 + 0],
@@ -545,7 +597,7 @@ int output_width
     );
     if(ray_direction.x == 0.f && ray_direction.y == 0.f && ray_direction.z == 0.f){ // ray did not escape black hole
         set_image_pixel(output_pixels, i, j, output_width, Color::Black());
-        return;    
+        if(return_if_ray_did_not_escape) return;    
     }
 
     float ray_resolution_multiplier = d_ray_resolution_multiplier_map[i * output_width + j];
@@ -583,6 +635,10 @@ int output_width
         skybox_color = extract_texture_color(skybox_texture_object, (elevation_angle -    0   ) / 180.f, (azimuth_angle -    0   ) / 360.f);
     }
 
+    float accretion_disk_intersection_color_alpha = 
+        (accretion_disk_intersection_color.red + accretion_disk_intersection_color.green + accretion_disk_intersection_color.blue) / 3.f / 255;
+    
+    skybox_color = accretion_disk_intersection_color * accretion_disk_intersection_color_alpha + skybox_color * (1 - accretion_disk_intersection_color_alpha);
     set_image_pixel(output_pixels, i, j, output_width, skybox_color); // TODO: shared mem?
 }
 
@@ -639,6 +695,7 @@ main(int argc, char * argv[]){
     constexpr float look_speed = 0.2f;    
 
     unsigned char * d_pixels;
+    unsigned char * d_accretion_disk_intersection;
     float * d_ray_direction_vector_map;
     float * d_output_ray_direction_vector_map;
     unsigned char * h_pixels = (unsigned char *)malloc(output_width * output_height * 3 * sizeof(unsigned char));
@@ -721,9 +778,9 @@ main(int argc, char * argv[]){
     for(int i = 0; i < gaussian_kernel_size; i++){
         memcpy((h_gaussian_kernel + i * gaussian_kernel_size), gaussian_kernel_matrix[i].data(), gaussian_kernel_size * sizeof(float));
     }
-    float * d_gaussian_kernel;
-    cudaHandleError(cudaMalloc((void **)&d_gaussian_kernel, gaussian_kernel_size * gaussian_kernel_size * sizeof(float)));
-    cudaHandleError(cudaMemcpy(d_gaussian_kernel, h_gaussian_kernel, gaussian_kernel_size * gaussian_kernel_size * sizeof(float), cudaMemcpyHostToDevice));
+    // float * d_gaussian_kernel; // TODO compare performance with constant memory
+    // cudaHandleError(cudaMalloc((void **)&d_gaussian_kernel, gaussian_kernel_size * gaussian_kernel_size * sizeof(float)));
+    cudaHandleError(cudaMemcpyToSymbol(vector_conv_kernel, h_gaussian_kernel, gaussian_kernel_size * gaussian_kernel_size * sizeof(float)));
 
     float * d_ray_resolution_multiplier_map;
     cudaHandleError(cudaMalloc((void **)&d_ray_resolution_multiplier_map, output_width * output_height * sizeof(float)));
@@ -770,10 +827,52 @@ main(int argc, char * argv[]){
     cudaTextureObject_t skybox_texture_object = 0;
     cudaHandleError(cudaCreateTextureObject(&skybox_texture_object, &skybox_resource_desc, &skybox_texture_desc, nullptr));
 
+    // accretion disk texture memory
+    cv::Mat accretion_disk_matrix = cv::imread(".\\textures\\accretion_disk.png");
+    if(skybox_matrix.empty()){
+        fprintf(stderr, "Error opening accretion disk file %s\n", ".\\textures\\accretion_disk.png");
+        exit(1);
+    }
+    if(accretion_disk_matrix.channels() == 3){
+        cv::cvtColor(accretion_disk_matrix, accretion_disk_matrix, cv::COLOR_BGR2RGBA);
+    }
+    accretion_disk_matrix.convertTo(accretion_disk_matrix, CV_32FC4);
+    printf("Accretion disk matrix info:\n");
+    printf("Datatype code: %d\n", accretion_disk_matrix.type());
+    printf("Accretion disk width: %d\n", accretion_disk_matrix.cols);
+    printf("Accretion disk height: %d\n", accretion_disk_matrix.rows);
+    printf("Accretion disk channels: %d\n", accretion_disk_matrix.channels());
+
+    unsigned int accretion_disk_width = accretion_disk_matrix.cols;
+    unsigned int accretion_disk_height = accretion_disk_matrix.rows;
+
+    cudaChannelFormatDesc accretion_disk_channel_desc = cudaCreateChannelDesc<float4>();
+    cudaArray_t accretion_disk_array;
+    cudaHandleError(cudaMallocArray(&accretion_disk_array, &accretion_disk_channel_desc, accretion_disk_width, accretion_disk_height));
+
+    const size_t accretion_disk_source_pitch = accretion_disk_width * sizeof(float4);
+    cudaHandleError(cudaMemcpy2DToArray(accretion_disk_array, 0, 0, accretion_disk_matrix.data, accretion_disk_source_pitch, accretion_disk_width * sizeof(float4), accretion_disk_height, cudaMemcpyHostToDevice));
+
+    cudaResourceDesc accretion_disk_resource_desc;
+    std::memset(&accretion_disk_resource_desc, 0, sizeof(cudaResourceDesc));
+    accretion_disk_resource_desc.resType = cudaResourceTypeArray;
+    accretion_disk_resource_desc.res.array.array = accretion_disk_array;
+
+    cudaTextureDesc accretion_disk_texture_desc;
+    std::memset(&accretion_disk_texture_desc, 0, sizeof(cudaTextureDesc));
+    accretion_disk_texture_desc.addressMode[0] = cudaAddressModeClamp;
+    accretion_disk_texture_desc.addressMode[1] = cudaAddressModeClamp;
+    accretion_disk_texture_desc.filterMode = cudaFilterModeLinear;
+    accretion_disk_texture_desc.readMode = cudaReadModeElementType;
+    accretion_disk_texture_desc.normalizedCoords = true;
+
+    cudaTextureObject_t accretion_disk_texture_object = 0;
+    cudaHandleError(cudaCreateTextureObject(&accretion_disk_texture_object, &accretion_disk_resource_desc, &accretion_disk_texture_desc, nullptr));
+
     // declaring black holes
     h_black_holes.push_back(BlackHole(500, Vector(0, 0, 0)));
-    h_black_holes.push_back(BlackHole(500, Vector(0, 0, 500)));
-    h_black_holes.push_back(BlackHole(500, Vector(0, 0, 1000)));
+    // h_black_holes.push_back(BlackHole(500, Vector(0, 0, 500)));
+    // h_black_holes.push_back(BlackHole(500, Vector(0, 0, 1000)));
     int num_black_holes = (int)h_black_holes.size();
 
     // allocating device memory
@@ -782,6 +881,7 @@ main(int argc, char * argv[]){
     cudaHandleError(cudaMemcpy(d_black_holes, h_black_holes.data(), num_black_holes * sizeof(BlackHole), cudaMemcpyHostToDevice));
     cudaHandleError(cudaMalloc((void **)&d_ray_direction_vector_map, output_width * output_height * 3 * sizeof(float)));
     cudaHandleError(cudaMalloc((void **)&d_output_ray_direction_vector_map, output_width * output_height * 3 * sizeof(float)));
+    cudaHandleError(cudaMalloc((void **)&d_accretion_disk_intersection, output_width * output_height * 3 * sizeof(unsigned char)));
 
     // initialize GLFW
     GLFWwindow* main_window;
@@ -811,7 +911,7 @@ main(int argc, char * argv[]){
     float angle = 0;
     float progress_percent = -1;
     auto t_start = std::chrono::high_resolution_clock::now();
-    camera.position = Vector(100, 0, 0);
+    camera.position = Vector(200, 30, 0);
 
     // float black_hole_distance = 40;
 
@@ -847,13 +947,28 @@ main(int argc, char * argv[]){
                                      // (works with 896 on my GPU, but might differ on others)
                                      // SOLUTION: switching from double precision to single precision
 
+        static int rotation_frames_processed = 0;
+        if(camera.position.length() > 30 && rotation_frames_processed == 0){
+            camera.position.x = (100 - frames_processed / 10.f);
+        }
+        else{
+            camera.position = Vector(
+                cosf(rotation_frames_processed / 100.f + PI / 2),
+                sinf(rotation_frames_processed / 100.f + PI / 2),
+                0
+            )*(30 - rotation_frames_processed / 100.f);
+            camera.up = camera.position.normalize();
+            camera.direction = camera.up ^ Vector::West();
+            rotation_frames_processed++;
+        }
+        
         auto frame_start = std::chrono::high_resolution_clock::now();
         while(remaining_width > 0){
             if(remaining_width >= threads_per_block){
-                ray<<<output_height, threads_per_block>>>(camera, skybox_texture_object, output_width, output_height, grid_index, threads_per_block, d_black_holes, num_black_holes, anti_aliasing, dynamic_ray_resolution, frames_processed, d_ray_direction_vector_map, d_ray_resolution_multiplier_map);
+                ray<<<output_height, threads_per_block>>>(camera, accretion_disk_texture_object, output_width, output_height, grid_index, threads_per_block, d_black_holes, num_black_holes, anti_aliasing, dynamic_ray_resolution, frames_processed, d_ray_direction_vector_map, d_ray_resolution_multiplier_map, d_accretion_disk_intersection);
             }
             else{ // remainder kernel call
-                ray<<<output_height, remaining_width>>>(camera, skybox_texture_object, output_width, output_height, grid_index, threads_per_block, d_black_holes, num_black_holes, anti_aliasing, dynamic_ray_resolution, frames_processed, d_ray_direction_vector_map, d_ray_resolution_multiplier_map);                
+                ray<<<output_height, remaining_width>>>(camera, accretion_disk_texture_object, output_width, output_height, grid_index, threads_per_block, d_black_holes, num_black_holes, anti_aliasing, dynamic_ray_resolution, frames_processed, d_ray_direction_vector_map, d_ray_resolution_multiplier_map, d_accretion_disk_intersection);                
             }
             cudaError_t cudaError = cudaGetLastError();
             if (cudaError != cudaSuccess) {
@@ -870,10 +985,10 @@ main(int argc, char * argv[]){
             grid_index = 0;
             while(remaining_width > 0){
                 if(remaining_width >= threads_per_block){
-                    ray_post_processing<<<output_height, threads_per_block>>>(d_ray_direction_vector_map, d_output_ray_direction_vector_map, grid_index, d_gaussian_kernel, gaussian_kernel_size, threads_per_block, output_width, output_height);
+                    ray_post_processing<<<output_height, threads_per_block>>>(d_ray_direction_vector_map, d_output_ray_direction_vector_map, grid_index, gaussian_kernel_size, threads_per_block, output_width, output_height);
                 }
                 else{
-                    ray_post_processing<<<output_height, remaining_width>>>(d_ray_direction_vector_map, d_output_ray_direction_vector_map, grid_index, d_gaussian_kernel, gaussian_kernel_size, threads_per_block, output_width, output_height);
+                    ray_post_processing<<<output_height, remaining_width>>>(d_ray_direction_vector_map, d_output_ray_direction_vector_map, grid_index, gaussian_kernel_size, threads_per_block, output_width, output_height);
                 }
                 cudaError_t cudaError = cudaGetLastError();
                 if (cudaError != cudaSuccess) {
@@ -893,10 +1008,10 @@ main(int argc, char * argv[]){
         grid_index = 0;
         while(remaining_width > 0){
             if(remaining_width >= threads_per_block){
-                skybox_texture_extraction<<<output_height, threads_per_block>>>(skybox_texture_object, d_output_ray_direction_vector_map, d_ray_resolution_multiplier_map, d_pixels, grid_index, threads_per_block, anti_aliasing, output_width);
+                skybox_texture_extraction<<<output_height, threads_per_block>>>(skybox_texture_object, d_output_ray_direction_vector_map, d_ray_resolution_multiplier_map, d_pixels, grid_index, threads_per_block, anti_aliasing, output_width, d_accretion_disk_intersection);
             }
             else{
-                skybox_texture_extraction<<<output_height, remaining_width>>>(skybox_texture_object, d_output_ray_direction_vector_map, d_ray_resolution_multiplier_map, d_pixels, grid_index, threads_per_block, anti_aliasing, output_width); 
+                skybox_texture_extraction<<<output_height, remaining_width>>>(skybox_texture_object, d_output_ray_direction_vector_map, d_ray_resolution_multiplier_map, d_pixels, grid_index, threads_per_block, anti_aliasing, output_width, d_accretion_disk_intersection); 
             }
             cudaError_t cudaError = cudaGetLastError();
             if (cudaError != cudaSuccess) {
@@ -994,10 +1109,10 @@ main(int argc, char * argv[]){
         // if(black_hole_distance < 0){
         //     break;
         // }
-        h_black_holes.clear();
-        h_black_holes.push_back(BlackHole(500, Vector(0, 0, 0)));
-        h_black_holes.push_back(BlackHole(500, Vector(0, 0, clip(500.f - angle/4.f, 0, 1000))));
-        h_black_holes.push_back(BlackHole(500, Vector(0, 0, clip(1000.f - 2*angle/4.f, 0, 1000))));
+        // h_black_holes.clear();
+        // h_black_holes.push_back(BlackHole(500, Vector(0, 0, 0)));
+        // h_black_holes.push_back(BlackHole(500, Vector(0, 0, clip(500.f - angle, 0, 1000))));
+        // h_black_holes.push_back(BlackHole(500, Vector(0, 0, clip(1000.f - 2*angle, 0, 1000))));
         
         cudaHandleError(cudaMemcpy(d_black_holes, h_black_holes.data(), h_black_holes.size() * sizeof(BlackHole), cudaMemcpyHostToDevice));
         auto other_end = std::chrono::high_resolution_clock::now();
