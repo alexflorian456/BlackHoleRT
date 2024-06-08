@@ -353,11 +353,10 @@ sinf_kernel(float x){
 
 __device__ Color
 extract_texture_color(cudaTextureObject_t texture_object, float i, float j){
-    float4 color_data = tex2D<float4>(texture_object, j, i);
     return Color(
-        color_data.x,
-        color_data.y,
-        color_data.z,
+        tex2D<float4>(texture_object, j, i).x,
+        tex2D<float4>(texture_object, j, i).y,
+        tex2D<float4>(texture_object, j, i).z,
         0
     );
 }
@@ -699,7 +698,8 @@ main(int argc, char * argv[]){
     unsigned char * d_accretion_disk_intersection;
     float * d_ray_direction_vector_map;
     float * d_output_ray_direction_vector_map;
-    unsigned char * h_pixels = (unsigned char *)malloc(output_width * output_height * 3 * sizeof(unsigned char));
+    unsigned char * h_pixels;// = (unsigned char *)malloc(output_width * output_height * 3 * sizeof(unsigned char));
+    cudaHandleError(cudaHostAlloc((void **)&h_pixels, output_width * output_height * 3 * sizeof(unsigned char), cudaHostAllocDefault));
     std::vector<unsigned char> h_skybox;
     unsigned int skybox_width   = UINT32_MAX;
     unsigned int skybox_height  = UINT32_MAX;
@@ -948,20 +948,21 @@ main(int argc, char * argv[]){
                                      // (works with 896 on my GPU, but might differ on others)
                                      // SOLUTION: switching from double precision to single precision
 
-        static int rotation_frames_processed = 0;
-        if(camera.position.length() > 30 && rotation_frames_processed == 0){
-            camera.position.x = (100 - frames_processed / 10.f);
-        }
-        else{
-            camera.position = Vector(
-                cosf(rotation_frames_processed / 100.f + PI / 2),
-                sinf(rotation_frames_processed / 100.f + PI / 2),
-                0
-            )*(30 - rotation_frames_processed / 100.f);
-            camera.up = camera.position.normalize();
-            camera.direction = camera.up ^ Vector::West();
-            rotation_frames_processed++;
-        }
+        // NASA DEMO
+        // static int rotation_frames_processed = 0;
+        // if(camera.position.length() > 30 && rotation_frames_processed == 0){
+        //     camera.position.x = (100 - frames_processed / 10.f);
+        // }
+        // else{
+        //     camera.position = Vector(
+        //         cosf(rotation_frames_processed / 100.f + PI / 2),
+        //         sinf(rotation_frames_processed / 100.f + PI / 2),
+        //         0
+        //     )*(30 - rotation_frames_processed / 100.f);
+        //     camera.up = camera.position.normalize();
+        //     camera.direction = camera.up ^ Vector::West();
+        //     rotation_frames_processed++;
+        // }
         
         auto frame_start = std::chrono::high_resolution_clock::now();
         while(remaining_width > 0){
